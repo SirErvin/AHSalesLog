@@ -1,0 +1,8 @@
+## Interface: 20505
+## Title: AH Sales Log
+## Notes: Protokolliert Auktionshaus-Verkäufe mit Zeitstempel und Preis
+## Author: Niklas Hiller
+## Version: 1.0
+## SavedVariables: AHSalesLogDB
+
+AHSalesLog.lua
