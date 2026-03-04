@@ -119,8 +119,9 @@ end
 -- ChatFrame-Filter: empfängt die FORMATIERTE Nachricht (inkl. Itemlinks).
 -- Gibt false zurück → Nachricht wird normal angezeigt, wir loggen nur mit.
 local function AHSalesLog_ChatFilter(_, _, msg)
-    if debugMode then
-        print("|cffaaaaff[AHLog Filter]|r " .. msg)
+    -- Immer printen wenn AH-Schlüsselwort gefunden (unabhängig von debugMode)
+    if msg:find("K.ufer") or msg:find("buyer") or msg:find("Auktion") or msg:find("auction") then
+        print("|cffff8800[AHLog]|r Filter: len=" .. #msg .. " >> " .. msg)
     end
 
     -- Versuche Itemname aus der formatierten Nachricht zu extrahieren
@@ -129,7 +130,7 @@ local function AHSalesLog_ChatFilter(_, _, msg)
             local item = msg:match(pattern)
             if item then
                 AddEntry(StripColors(item), nil)
-                return false  -- Nachricht nicht unterdrücken
+                return false
             end
         end
     end
@@ -145,10 +146,10 @@ local function AHSalesLog_ChatFilter(_, _, msg)
     return false
 end
 
--- Backup: roher CHAT_MSG_SYSTEM Event (ohne Itemname, nur als Sicherheit)
 local function OnChatMsgSystem(msg)
-    if debugMode then
-        print("|cffaaaaff[AHLog Raw]|r len=" .. #msg .. " | " .. msg)
+    -- Immer printen wenn AH-Schlüsselwort gefunden
+    if msg:find("K.ufer") or msg:find("buyer") or msg:find("Auktion") or msg:find("auction") then
+        print("|cffaaaaff[AHLog]|r Raw: len=" .. #msg .. " >> " .. msg)
     end
 end
 
