@@ -382,7 +382,7 @@ local function SetMinimapPos(btn)
 end
 
 local function CreateMinimapButton()
-    local btn = CreateFrame("Button", "AHSalesLogMinimapBtn", Minimap)
+    local btn = CreateFrame("Button", "AHSalesLog", Minimap)
     btn:SetSize(32, 32)
     btn:SetFrameStrata("MEDIUM")
     btn:SetFrameLevel(8)
@@ -418,7 +418,7 @@ local function CreateMinimapButton()
 
     btn:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_LEFT")
-        GameTooltip:SetText("AH Sales Log", 1, 1, 1)
+        GameTooltip:SetText("AH Log", 1, 1, 1)
         GameTooltip:AddLine("Klick: Fenster ein-/ausblenden", 0.8, 0.8, 0.8)
         GameTooltip:AddLine("Drag: Position ändern",          0.8, 0.8, 0.8)
         GameTooltip:Show()
