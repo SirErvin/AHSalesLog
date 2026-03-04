@@ -1,5 +1,5 @@
 -- AHSalesLog.lua
--- Protokolliert Auktionshaus-Verkäufe aus System-Chat-Nachrichten
+-- Protokolliert Auktionshaus-Verkäufe
 -- Interface: TBC Classic Anniversary
 
 -- ============================================================
@@ -8,32 +8,7 @@
 
 local ADDON_NAME = "AHSalesLog"
 local MAX_ENTRIES = 200
-local debugMode   = false  -- per /ahlogdebug ein-/ausschalten
 
--- Patterns für die FORMATIERTE Chat-Nachricht (inkl. Itemname).
--- Das Chat-Frame fügt den Itemnamen erst beim Rendern hinzu – daher nutzen wir
--- ChatFrame_AddMessageEventFilter statt dem rohen CHAT_MSG_SYSTEM-Event.
--- Umlaute als "." um Kodierungsprobleme zu umgehen.
-local PATTERNS_SOLD = {
-    -- Aus WoW-Global-String (automatisch lokalisiert, falls vorhanden)
-    ERR_AUCTION_SOLD_S and string.gsub(ERR_AUCTION_SOLD_S, "%%s", "(.+)") or nil,
-    -- DE TBC Anniversary: "...gefunden: Item"
-    "Es wurde ein K.ufer f.r Eure Auktion gefunden: (.+)",
-    -- DE älteres Format: "...von Item gefunden."
-    "Ein K.ufer wurde f.r .* Auktion von (.+) gefunden",
-    -- EN Format
-    "A buyer has been found for your auction of (.+)",
-}
-
--- Trigger-Patterns (ohne Itemname) als letzter Fallback
-local PATTERNS_TRIGGER = {
-    "Es wurde ein K.ufer f.r Eure Auktion gefunden",
-    "A buyer has been found for your auction",
-}
-local unseenCount = 0    -- Badge-Zähler Minimap
-local minimapBtn  = nil  -- forward declare
-
--- Spaltenbreiten
 local COL_TS    = 80
 local COL_ITEM  = 185
 local COL_PRICE = 95
@@ -47,6 +22,12 @@ local PAD          = 8
 local AHSalesLogFrame = nil
 local scrollChild     = nil
 local rowFrames       = {}
+local unseenCount     = 0
+local minimapBtn      = nil
+
+-- Rate-Limiter für Chat-Filter (verhindert Doppeleinträge bei mehreren Chatframes)
+local lastFilterMsg  = nil
+local lastFilterTime = 0
 
 -- ============================================================
 -- SavedVariables initialisieren
@@ -54,13 +35,40 @@ local rowFrames       = {}
 
 local function InitDB()
     if not AHSalesLogDB then AHSalesLogDB = {} end
-    if not AHSalesLogDB.entries      then AHSalesLogDB.entries      = {}                           end
+    if not AHSalesLogDB.entries      then AHSalesLogDB.entries      = {} end
     if not AHSalesLogDB.framePos     then AHSalesLogDB.framePos     = { point="CENTER", x=0, y=0 } end
-    if not AHSalesLogDB.minimapAngle then AHSalesLogDB.minimapAngle = 225                          end
+    if not AHSalesLogDB.minimapAngle then AHSalesLogDB.minimapAngle = 225 end
+    if not AHSalesLogDB.seenMailKeys then AHSalesLogDB.seenMailKeys = {} end
 end
 
 local function GetTimestamp()
     return date("%d.%m. %H:%M")
+end
+
+-- ============================================================
+-- Hilfsfunktionen
+-- ============================================================
+
+local function FormatMoney(copper)
+    if not copper or copper == 0 then return "" end
+    local g = math.floor(copper / 10000)
+    local s = math.floor((copper % 10000) / 100)
+    local c = copper % 100
+    local parts = {}
+    if g > 0 then table.insert(parts, g .. "g") end
+    if s > 0 then table.insert(parts, s .. "s") end
+    if c > 0 then table.insert(parts, c .. "k") end
+    return table.concat(parts, " ")
+end
+
+-- Itemlinks und Farbcodes entfernen
+local function StripLinks(s)
+    return s:gsub("|c%x%x%x%x%x%x%x%x", "")
+             :gsub("|h%[(.-)%]|h", "%1")
+             :gsub("|H[^|]+|h", "")
+             :gsub("|h", "")
+             :gsub("|r", "")
+             :match("^%s*(.-)%s*$")
 end
 
 -- ============================================================
@@ -78,7 +86,7 @@ local function UpdateMinimapBadge()
 end
 
 -- ============================================================
--- Eintrag hinzufügen
+-- Eintrag hinzufügen / Preis nachträglich setzen
 -- ============================================================
 
 local function AddEntry(item, price)
@@ -99,63 +107,119 @@ local function AddEntry(item, price)
     end
 end
 
--- ============================================================
--- Item-Farb-Codes aus einem String entfernen
--- ============================================================
-
-local function StripColors(s)
-    return s:gsub("|c%x%x%x%x%x%x%x%x", "")
-             :gsub("|h%[(.-)%]|h", "%1")
-             :gsub("|[Hhr].-|h", "")
-             :gsub("|r", "")
-             :gsub("%.$", "")
-             :match("^%s*(.-)%s*$")
+-- Sucht den neuesten Eintrag ohne Preis für das gegebene Item und setzt den Preis.
+-- Gibt true zurück wenn ein Eintrag aktualisiert wurde, sonst false.
+local function EnrichEntryPrice(item, priceStr)
+    for _, entry in ipairs(AHSalesLogDB.entries) do
+        if entry.price == "" and entry.item == item then
+            entry.price = priceStr
+            return true
+        end
+    end
+    return false
 end
 
 -- ============================================================
--- Chat-Event-Handler
+-- Chat-Filter: sofortige Erkennung mit Itemname
 -- ============================================================
 
--- ChatFrame-Filter: empfängt die FORMATIERTE Nachricht (inkl. Itemlinks).
--- Gibt false zurück → Nachricht wird normal angezeigt, wir loggen nur mit.
+-- Erkläre warum kein Umlaut im Pattern: "Käufer" / "für" sind in UTF-8
+-- mehrere Bytes; Lua-Pattern "." matcht nur ein Byte. Daher suchen wir
+-- nach dem Schlüsselwort "gefunden: " (kein Umlaut), das direkt vor dem
+-- Itemnamen steht.
+
 local function AHSalesLog_ChatFilter(_, _, msg)
-    -- Immer printen wenn AH-Schlüsselwort gefunden (unabhängig von debugMode)
-    if msg:find("K.ufer") or msg:find("buyer") or msg:find("Auktion") or msg:find("auction") then
-        print("|cffff8800[AHLog]|r Filter: len=" .. #msg .. " >> " .. msg)
+    -- DE: "... gefunden: <Item>"
+    -- EN: "... found for your auction of <Item>"
+    local item = msg:match("gefunden: (.-)%s*$")
+                 or msg:match("found for your auction of (.-)%s*$")
+
+    if item and item ~= "" then
+        local now = GetTime()
+        -- Rate-Limiter: selbe Nachricht nicht mehrfach verarbeiten
+        -- (Filter feuert einmal pro Chatframe)
+        if msg ~= lastFilterMsg or (now - lastFilterTime) > 1.0 then
+            lastFilterMsg  = msg
+            lastFilterTime = now
+            AddEntry(StripLinks(item), nil)
+        end
     end
 
-    -- Versuche Itemname aus der formatierten Nachricht zu extrahieren
-    for _, pattern in ipairs(PATTERNS_SOLD) do
-        if pattern then
-            local item = msg:match(pattern)
-            if item then
-                AddEntry(StripColors(item), nil)
-                return false
+    return false  -- Nachricht normal anzeigen
+end
+
+-- ============================================================
+-- Postfach: Preise nachträglich anreichern
+-- ============================================================
+
+local AH_SENDERS = { "Auktionshaus", "Auction House" }
+
+local function IsAHSender(sender)
+    if not sender then return false end
+    for _, name in ipairs(AH_SENDERS) do
+        if sender:find(name, 1, true) then return true end
+    end
+    return false
+end
+
+local function ScanMailbox()
+    local numItems = GetInboxNumItems()
+    if numItems == 0 then return end
+
+    local seenKeys  = AHSalesLogDB.seenMailKeys
+    local refreshUI = false
+
+    for i = 1, numItems do
+        -- packageIcon, stationeryIcon, sender, subject, money, CODAmount, daysLeft, ...
+        local _, _, sender, subject, money, _, daysLeft = GetInboxHeaderInfo(i)
+
+        if IsAHSender(sender) and money and money > 0 then
+            local key = (subject or "") .. "|" .. tostring(money) .. "|" .. tostring(math.floor((daysLeft or 0) * 100))
+
+            if not seenKeys[key] then
+                seenKeys[key] = true
+
+                -- Itemname aus Betreff extrahieren
+                -- TBC-Format: "[Itemname]" oder als Klartext
+                local item = nil
+                if subject then
+                    item = subject:match("%[(.-)%]") or StripLinks(subject)
+                end
+
+                local priceStr = FormatMoney(money)
+
+                if item and item ~= "" then
+                    -- Vorhandenen preislosen Eintrag anreichern, sonst neu anlegen
+                    if not EnrichEntryPrice(item, priceStr) then
+                        AddEntry(item, priceStr)
+                    end
+                    refreshUI = true
+                end
             end
         end
     end
 
-    -- Fallback: Trigger erkannt aber kein Itemname → trotzdem loggen
-    for _, pattern in ipairs(PATTERNS_TRIGGER) do
-        if msg:find(pattern) then
-            AddEntry("(Unbekannt)", nil)
-            return false
+    -- seenMailKeys auf max. 500 Einträge begrenzen
+    local count = 0
+    for _ in pairs(seenKeys) do count = count + 1 end
+    if count > 500 then
+        AHSalesLogDB.seenMailKeys = {}
+        for i = 1, numItems do
+            local _, _, sender, subject, money, _, daysLeft = GetInboxHeaderInfo(i)
+            if IsAHSender(sender) and money and money > 0 then
+                local key = (subject or "") .. "|" .. tostring(money) .. "|" .. tostring(math.floor((daysLeft or 0) * 100))
+                AHSalesLogDB.seenMailKeys[key] = true
+            end
         end
     end
 
-    return false
-end
-
-local function OnChatMsgSystem(msg)
-    -- Immer printen wenn AH-Schlüsselwort gefunden
-    if msg:find("K.ufer") or msg:find("buyer") or msg:find("Auktion") or msg:find("auction") then
-        print("|cffaaaaff[AHLog]|r Raw: len=" .. #msg .. " >> " .. msg)
+    if refreshUI and AHSalesLogFrame and AHSalesLogFrame:IsShown() then
+        AHSalesLog_RefreshList()
     end
 end
 
 -- ============================================================
--- UI: Hauptfenster (BasicFrameTemplateWithInset – funktioniert
---     im modernen Classic-Client; SetColorTexture ebenfalls)
+-- UI: Hauptfenster
 -- ============================================================
 
 local function CreateMainFrame()
@@ -177,12 +241,10 @@ local function CreateMainFrame()
         AHSalesLogDB.framePos = { point = point, x = x, y = y }
     end)
 
-    -- --------------------------------------------------------
     -- Spaltenüberschriften
-    -- --------------------------------------------------------
     local headerBg = f:CreateTexture(nil, "BACKGROUND")
     headerBg:SetColorTexture(0, 0, 0, 0.5)
-    headerBg:SetPoint("TOPLEFT",  f, "TOPLEFT",  PAD,      -28)
+    headerBg:SetPoint("TOPLEFT",  f, "TOPLEFT",  PAD,       -28)
     headerBg:SetPoint("TOPRIGHT", f, "TOPRIGHT", -(PAD+20), -28)
     headerBg:SetHeight(HEADER_H)
 
@@ -196,24 +258,18 @@ local function CreateMainFrame()
     MakeHeader("Item",  2 + COL_TS + 4)
     MakeHeader("Preis", 2 + COL_TS + 4 + COL_ITEM + 4)
 
-    -- --------------------------------------------------------
-    -- ScrollFrame (unterhalb Header)
-    -- --------------------------------------------------------
+    -- ScrollFrame
     local sf = CreateFrame("ScrollFrame", "AHSalesLogScrollFrame", f, "UIPanelScrollFrameTemplate")
     sf:SetPoint("TOPLEFT",     f, "TOPLEFT",  PAD,       -28 - HEADER_H)
     sf:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -(PAD+20), 30)
 
     local sc = CreateFrame("Frame", "AHSalesLogScrollChild", sf)
-    -- Breite fest berechnen statt sf:GetWidth() – der ScrollFrame ist beim
-    -- ersten Aufruf noch hidden, GetWidth() würde 0 zurückgeben.
     sc:SetWidth(FRAME_WIDTH - PAD - (PAD + 20))  -- = 364
     sc:SetHeight(1)
     sf:SetScrollChild(sc)
     scrollChild = sc
 
-    -- --------------------------------------------------------
     -- "Leeren"-Button
-    -- --------------------------------------------------------
     local clearBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
     clearBtn:SetSize(80, 22)
     clearBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", PAD, 6)
@@ -223,7 +279,6 @@ local function CreateMainFrame()
         AHSalesLog_RefreshList()
     end)
 
-    -- Anzahl-Label
     local countLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     countLabel:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -(PAD+20), 10)
     countLabel:SetTextColor(0.6, 0.6, 0.6)
@@ -239,7 +294,6 @@ end
 function AHSalesLog_RefreshList()
     local entries = AHSalesLogDB.entries
     local count   = #entries
-    print("|cffaaaaff[AHLog]|r RefreshList: " .. count .. " Einträge, scrollChild=" .. tostring(scrollChild ~= nil))
 
     for _, row in ipairs(rowFrames) do row:Hide() end
 
@@ -270,7 +324,6 @@ function AHSalesLog_RefreshList()
             row.price:SetWidth(COL_PRICE)
             row.price:SetJustifyH("LEFT")
 
-            -- Tooltip für abgeschnittene Itemnamen
             row:SetScript("OnEnter", function(self)
                 if self.fullItem and self.fullItem ~= "" then
                     GameTooltip:SetOwner(self, "ANCHOR_CURSOR")
@@ -347,7 +400,6 @@ local function CreateMinimapButton()
 
     btn:SetHighlightTexture("Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight")
 
-    -- Badge
     local badge = CreateFrame("Frame", nil, btn)
     badge:SetSize(14, 14)
     badge:SetPoint("TOPRIGHT", btn, "TOPRIGHT", 0, 0)
@@ -429,7 +481,7 @@ end
 
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("ADDON_LOADED")
-eventFrame:RegisterEvent("CHAT_MSG_SYSTEM")
+eventFrame:RegisterEvent("MAIL_INBOX_UPDATE")
 
 eventFrame:SetScript("OnEvent", function(self, event, ...)
     if event == "ADDON_LOADED" then
@@ -437,16 +489,6 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         if name ~= ADDON_NAME then return end
 
         InitDB()
-
-        -- Aktive Patterns beim Login ausgeben
-        print("|cff00ff00AHSalesLog:|r " .. #PATTERNS_SOLD .. " Patterns geladen.")
-        for i, p in ipairs(PATTERNS_SOLD) do
-            if p then print("  [" .. i .. "] " .. p) end
-        end
-
-        -- ChatFrame-Filter registrieren: empfängt formatierte Nachrichten mit Itemnamen
-        ChatFrame_AddMessageEventFilter("CHAT_MSG_SYSTEM", AHSalesLog_ChatFilter)
-
         CreateMainFrame()
         CreateMinimapButton()
 
@@ -454,29 +496,22 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         AHSalesLogFrame:ClearAllPoints()
         AHSalesLogFrame:SetPoint(pos.point, UIParent, pos.point, pos.x, pos.y)
 
-        -- /ahlog – Fenster öffnen/schließen
+        -- Chat-Filter registrieren (empfängt formatierte Nachrichten inkl. Itemname)
+        ChatFrame_AddMessageEventFilter("CHAT_MSG_SYSTEM", AHSalesLog_ChatFilter)
+
         SLASH_AHSALESLOG1 = "/ahlog"
         SLASH_AHSALESLOG2 = "/ahsaleslog"
         SlashCmdList["AHSALESLOG"] = ToggleFrame
 
-        -- /ahlogtest – Testeintrag hinzufügen (UI-Test)
         SLASH_AHSALESLOGTEST1 = "/ahlogtest"
         SlashCmdList["AHSALESLOGTEST"] = function()
-            AddEntry("Schattenpanzerhelm", "5 Gold 32 Silber 10 Kupfer")
+            AddEntry("Schattenpanzerhelm", "5g 32s 10k")
             print("|cff00ff00AHSalesLog:|r Testeintrag hinzugefügt.")
         end
 
-        -- /ahlogdebug – alle CHAT_MSG_SYSTEM Nachrichten in den Chat ausgeben
-        -- (Hilft den echten AH-Verkaufstext zu sehen und Patterns anzupassen)
-        SLASH_AHSALESLOGDEBUG1 = "/ahlogdebug"
-        SlashCmdList["AHSALESLOGDEBUG"] = function()
-            debugMode = not debugMode
-            print("|cff00ff00AHSalesLog:|r Debug-Modus " .. (debugMode and "|cff00ff00AN" or "|cffff4444AUS") .. "|r")
-        end
+        print("|cff00ff00AHSalesLog|r geladen.  /ahlog  /ahlogtest")
 
-        print("|cff00ff00AHSalesLog|r geladen.  /ahlog  /ahlogtest  /ahlogdebug")
-
-    elseif event == "CHAT_MSG_SYSTEM" then
-        OnChatMsgSystem(...)
+    elseif event == "MAIL_INBOX_UPDATE" then
+        ScanMailbox()
     end
 end)
