@@ -189,11 +189,10 @@ local function ScanMailbox()
                 local priceStr = FormatMoney(money)
 
                 if item and item ~= "" then
-                    -- Vorhandenen preislosen Eintrag anreichern, sonst neu anlegen
-                    if not EnrichEntryPrice(item, priceStr) then
-                        AddEntry(item, priceStr)
+                    -- Vorhandenen preislosen Eintrag anreichern (kein neuer Eintrag)
+                    if EnrichEntryPrice(item, priceStr) then
+                        refreshUI = true
                     end
-                    refreshUI = true
                 end
             end
         end
