@@ -7,7 +7,7 @@
 -- ============================================================
 
 local ADDON_NAME = "AHSalesLog"
-local ADDON_VERSION = "1.4.0"
+local ADDON_VERSION = "1.5.0"
 local MAX_ENTRIES = 200
 
 local COL_TS    = 80
@@ -169,18 +169,22 @@ local function FindPendingPrice(itemName)
     return nil
 end
 
--- Item-Info wird vom NEW_AUCTION_UPDATE-Event erfasst, BEVOR StartAuction aufgerufen wird.
-local pendingItemName  = nil
-local pendingItemCount = nil
-local startAuctionHooked = false
+-- Slot-Monitor: Erfasst Item-Info und Buyout-Preis wenn eine Auktion erstellt wird.
+-- Funktioniert unabhängig vom konkreten API-Funktionsnamen.
+-- Ablauf:
+--   1. NEW_AUCTION_UPDATE: Item im Slot -> Name + Buyout aus UI merken
+--   2. NEW_AUCTION_UPDATE: Slot leer + kein Item am Cursor -> Auktion wurde erstellt
+local pendingSellName  = nil
+local pendingSellCount = nil
+local pendingSellBuyout = 0
+local ahIsOpen = false
 
-local function AddPendingAuction(itemName, itemCount, startPrice, buyoutPrice)
+local function AddPendingAuction(itemName, itemCount, buyoutPrice)
     if not itemName then return end
-    local price = buyoutPrice and buyoutPrice > 0 and buyoutPrice or startPrice
     table.insert(AHSalesLogDB.pendingAuctions, {
         item     = itemName,
-        buyout   = price,
-        priceStr = FormatMoney(price),
+        buyout   = buyoutPrice,
+        priceStr = FormatMoney(buyoutPrice),
         count    = itemCount or 1,
         posted   = time(),
         time     = GetTimestamp(),
@@ -193,27 +197,56 @@ local function AddPendingAuction(itemName, itemCount, startPrice, buyoutPrice)
     end
 end
 
-local function HookAuctionHouse()
-    if startAuctionHooked then return end
+-- Liest den aktuellen Buyout-Preis aus dem AH-Eingabefeld
+local function ReadBuyoutFromUI()
+    if BuyoutPrice and MoneyInputFrame_GetCopper then
+        return MoneyInputFrame_GetCopper(BuyoutPrice) or 0
+    end
+    return 0
+end
 
-    -- StartAuction hooken: wird aufgerufen wenn der Spieler "Auktion erstellen" klickt.
-    -- Item-Info liegt zu diesem Zeitpunkt bereits in pendingItemName vor
-    -- (erfasst durch NEW_AUCTION_UPDATE).
-    if StartAuction then
-        hooksecurefunc("StartAuction", function(startPrice, buyoutPrice, duration)
-            -- Versuche Item-Info direkt zu lesen (manchmal noch verfügbar)
-            local name, _, count
-            if GetAuctionSellItemInfo then
-                name, _, count = GetAuctionSellItemInfo()
-            end
-            -- Fallback: vorher durch NEW_AUCTION_UPDATE gespeicherte Info
-            name  = name  or pendingItemName
-            count = count or pendingItemCount
-            AddPendingAuction(name, count, startPrice, buyoutPrice)
-        end)
-        startAuctionHooked = true
+-- Wird bei jedem NEW_AUCTION_UPDATE aufgerufen
+local function OnAuctionSlotChanged()
+    if not GetAuctionSellItemInfo then return end
+    local name, _, count = GetAuctionSellItemInfo()
+
+    if name then
+        -- Item wurde in den Sell-Slot gelegt -> merken
+        pendingSellName  = name
+        pendingSellCount = count
+    elseif pendingSellName then
+        -- Slot ist jetzt leer und wir hatten ein Item gemerkt.
+        -- Prüfe ob das Item am Cursor hängt (= Spieler hat es zurückgenommen)
+        local cursorType = GetCursorInfo()
+        if cursorType ~= "item" then
+            -- Nicht am Cursor = Auktion wurde erfolgreich erstellt
+            local buyout = ReadBuyoutFromUI()
+            -- Buyout könnte nach dem Posten schon 0 sein;
+            -- nutze den zuletzt gespeicherten Wert als Fallback
+            if buyout == 0 then buyout = pendingSellBuyout end
+            AddPendingAuction(pendingSellName, pendingSellCount, buyout)
+        end
+        pendingSellName  = nil
+        pendingSellCount = nil
+        pendingSellBuyout = 0
     end
 end
+
+-- Polling: speichert den Buyout-Preis regelmäßig solange ein Item im Slot liegt,
+-- damit wir den Wert noch haben falls das UI-Feld nach dem Posten geleert wird.
+local pollFrame = CreateFrame("Frame")
+pollFrame:Hide()
+local pollElapsed = 0
+pollFrame:SetScript("OnUpdate", function(self, elapsed)
+    pollElapsed = pollElapsed + elapsed
+    if pollElapsed < 0.2 then return end
+    pollElapsed = 0
+    if not ahIsOpen or not pendingSellName then return end
+    local buyout = ReadBuyoutFromUI()
+    if buyout > 0 then
+        pendingSellBuyout = buyout
+    end
+end)
 
 -- ============================================================
 -- Chat-Filter: sofortige Erkennung mit Itemname
@@ -620,6 +653,7 @@ local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("ADDON_LOADED")
 eventFrame:RegisterEvent("MAIL_INBOX_UPDATE")
 eventFrame:RegisterEvent("AUCTION_HOUSE_SHOW")
+eventFrame:RegisterEvent("AUCTION_HOUSE_CLOSED")
 eventFrame:RegisterEvent("NEW_AUCTION_UPDATE")
 
 eventFrame:SetScript("OnEvent", function(self, event, ...)
@@ -677,28 +711,41 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         SlashCmdList["AHSALESLOGDEBUG"] = function()
             print("|cff00ff00AHSalesLog Debug:|r")
             print("  Version: " .. ADDON_VERSION)
-            print("  StartAuction: " .. (StartAuction and "vorhanden" or "|cffff0000nicht gefunden|r"))
-            print("  StartAuction hooked: " .. (startAuctionHooked and "ja" or "|cffff0000nein|r"))
+            print("  AH offen: " .. (ahIsOpen and "ja" or "nein"))
             print("  GetAuctionSellItemInfo: " .. (GetAuctionSellItemInfo and "vorhanden" or "|cffff0000nicht gefunden|r"))
-            print("  Pending Item (Slot): " .. (pendingItemName or "keins"))
+            print("  BuyoutPrice Frame: " .. (BuyoutPrice and "vorhanden" or "|cffff0000nicht gefunden|r"))
+            print("  Sell-Slot Item: " .. (pendingSellName or "leer"))
+            print("  Gespeicherter Buyout: " .. FormatMoney(pendingSellBuyout))
             print("  Pending Auctions: " .. #AHSalesLogDB.pendingAuctions)
             print("  Sold Entries: " .. #AHSalesLogDB.entries)
+            -- Aktuellen Sell-Slot live auslesen
+            if GetAuctionSellItemInfo then
+                local n = GetAuctionSellItemInfo()
+                print("  Slot LIVE: " .. (n or "leer"))
+            end
+            if BuyoutPrice and MoneyInputFrame_GetCopper then
+                print("  Buyout LIVE: " .. FormatMoney(MoneyInputFrame_GetCopper(BuyoutPrice) or 0))
+            end
         end
 
         print("|cff00ff00AHSalesLog|r v" .. ADDON_VERSION .. " geladen.  /ahlog  /ahlogdebug")
 
     elseif event == "AUCTION_HOUSE_SHOW" then
-        HookAuctionHouse()
+        ahIsOpen = true
+        pollFrame:Show()
+        pendingSellName  = nil
+        pendingSellCount = nil
+        pendingSellBuyout = 0
+
+    elseif event == "AUCTION_HOUSE_CLOSED" then
+        ahIsOpen = false
+        pollFrame:Hide()
+        pendingSellName  = nil
+        pendingSellCount = nil
+        pendingSellBuyout = 0
 
     elseif event == "NEW_AUCTION_UPDATE" then
-        -- Item wurde in den Auktions-Slot gelegt -> Info erfassen
-        if GetAuctionSellItemInfo then
-            local name, _, count = GetAuctionSellItemInfo()
-            if name then
-                pendingItemName  = name
-                pendingItemCount = count
-            end
-        end
+        OnAuctionSlotChanged()
 
     elseif event == "MAIL_INBOX_UPDATE" then
         ScanMailbox()
