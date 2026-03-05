@@ -7,6 +7,7 @@
 -- ============================================================
 
 local ADDON_NAME = "AHSalesLog"
+local ADDON_VERSION = "1.2.0"
 local MAX_ENTRIES = 200
 
 local COL_TS    = 80
@@ -296,7 +297,7 @@ local function CreateMainFrame()
     f:SetToplevel(true)
     f:Hide()
 
-    f.TitleText:SetText("AH Sales Log")
+    f.TitleText:SetText("AH Sales Log  v" .. ADDON_VERSION)
 
     f:SetScript("OnDragStart", f.StartMoving)
     f:SetScript("OnDragStop", function(self)
