@@ -14,9 +14,10 @@ local COL_ITEM  = 185
 local COL_PRICE = 95
 
 local FRAME_WIDTH  = 400
-local FRAME_HEIGHT = 320
+local FRAME_HEIGHT = 345
 local ROW_HEIGHT   = 18
 local HEADER_H     = 16
+local TAB_H        = 22
 local PAD          = 8
 
 local AHSalesLogFrame = nil
@@ -24,6 +25,9 @@ local scrollChild     = nil
 local rowFrames       = {}
 local unseenCount     = 0
 local minimapBtn      = nil
+local activeTab       = "sold"   -- "sold" oder "listed"
+local tabBtnSold      = nil
+local tabBtnListed    = nil
 
 -- Rate-Limiter für Chat-Filter (verhindert Doppeleinträge bei mehreren Chatframes)
 local lastFilterMsg  = nil
@@ -35,11 +39,11 @@ local lastFilterTime = 0
 
 local function InitDB()
     if not AHSalesLogDB then AHSalesLogDB = {} end
-    if not AHSalesLogDB.entries      then AHSalesLogDB.entries      = {} end
-    if not AHSalesLogDB.framePos     then AHSalesLogDB.framePos     = { point="CENTER", x=0, y=0 } end
-    if not AHSalesLogDB.minimapAngle then AHSalesLogDB.minimapAngle = 225 end
-    if not AHSalesLogDB.seenMailKeys      then AHSalesLogDB.seenMailKeys      = {} end
-    if not AHSalesLogDB.pendingAuctions   then AHSalesLogDB.pendingAuctions   = {} end
+    if not AHSalesLogDB.entries          then AHSalesLogDB.entries          = {} end
+    if not AHSalesLogDB.framePos         then AHSalesLogDB.framePos         = { point="CENTER", x=0, y=0 } end
+    if not AHSalesLogDB.minimapAngle     then AHSalesLogDB.minimapAngle     = 225 end
+    if not AHSalesLogDB.seenMailKeys     then AHSalesLogDB.seenMailKeys     = {} end
+    if not AHSalesLogDB.pendingAuctions  then AHSalesLogDB.pendingAuctions  = {} end
 
     -- Alte pending-Einträge entfernen (älter als 48h)
     local now = time()
@@ -96,6 +100,21 @@ local function UpdateMinimapBadge()
 end
 
 -- ============================================================
+-- Tab-Styling
+-- ============================================================
+
+local function UpdateTabStyle()
+    if not tabBtnSold or not tabBtnListed then return end
+    if activeTab == "sold" then
+        tabBtnSold:SetNormalFontObject("GameFontNormal")
+        tabBtnListed:SetNormalFontObject("GameFontNormalSmall")
+    else
+        tabBtnSold:SetNormalFontObject("GameFontNormalSmall")
+        tabBtnListed:SetNormalFontObject("GameFontNormal")
+    end
+end
+
+-- ============================================================
 -- Eintrag hinzufügen / Preis nachträglich setzen
 -- ============================================================
 
@@ -118,7 +137,6 @@ local function AddEntry(item, price)
 end
 
 -- Sucht den neuesten Eintrag ohne Preis für das gegebene Item und setzt den Preis.
--- Gibt true zurück wenn ein Eintrag aktualisiert wurde, sonst false.
 local function EnrichEntryPrice(item, priceStr)
     for _, entry in ipairs(AHSalesLogDB.entries) do
         if entry.price == "" and entry.item == item then
@@ -139,8 +157,11 @@ local function FindPendingPrice(itemName)
     local pending = AHSalesLogDB.pendingAuctions
     for i, entry in ipairs(pending) do
         if entry.item == itemName then
-            local priceStr = FormatMoney(entry.buyout)
+            local priceStr = entry.priceStr or FormatMoney(entry.buyout)
             table.remove(pending, i)
+            if AHSalesLogFrame and AHSalesLogFrame:IsShown() and activeTab == "listed" then
+                AHSalesLog_RefreshList()
+            end
             return priceStr
         end
     end
@@ -153,14 +174,19 @@ local function HookPostAuction()
         if name then
             local price = buyoutPrice and buyoutPrice > 0 and buyoutPrice or startPrice
             table.insert(AHSalesLogDB.pendingAuctions, {
-                item   = name,
-                buyout = price,
-                count  = count or 1,
-                posted = time(),
+                item     = name,
+                buyout   = price,
+                priceStr = FormatMoney(price),
+                count    = count or 1,
+                posted   = time(),
+                time     = GetTimestamp(),
             })
             -- Limit auf 200
             while #AHSalesLogDB.pendingAuctions > 200 do
                 table.remove(AHSalesLogDB.pendingAuctions, 1)
+            end
+            if AHSalesLogFrame and AHSalesLogFrame:IsShown() and activeTab == "listed" then
+                AHSalesLog_RefreshList()
             end
         end
     end)
@@ -170,21 +196,15 @@ end
 -- Chat-Filter: sofortige Erkennung mit Itemname
 -- ============================================================
 
--- Erkläre warum kein Umlaut im Pattern: "Käufer" / "für" sind in UTF-8
--- mehrere Bytes; Lua-Pattern "." matcht nur ein Byte. Daher suchen wir
--- nach dem Schlüsselwort "gefunden: " (kein Umlaut), das direkt vor dem
--- Itemnamen steht.
+-- UTF-8 Hinweis: "Käufer" / "für" enthalten Umlaute (2 Bytes in UTF-8).
+-- Lua-Pattern "." matcht nur 1 Byte. Daher suchen wir nach "gefunden: ".
 
 local function AHSalesLog_ChatFilter(_, _, msg)
-    -- DE: "... gefunden: <Item>"
-    -- EN: "... found for your auction of <Item>"
     local item = msg:match("gefunden: (.-)%s*$")
                  or msg:match("found for your auction of (.-)%s*$")
 
     if item and item ~= "" then
         local now = GetTime()
-        -- Rate-Limiter: selbe Nachricht nicht mehrfach verarbeiten
-        -- (Filter feuert einmal pro Chatframe)
         if msg ~= lastFilterMsg or (now - lastFilterTime) > 0.05 then
             lastFilterMsg  = msg
             lastFilterTime = now
@@ -194,7 +214,7 @@ local function AHSalesLog_ChatFilter(_, _, msg)
         end
     end
 
-    return false  -- Nachricht normal anzeigen
+    return false
 end
 
 -- ============================================================
@@ -227,8 +247,6 @@ local function ScanMailbox()
             if not seenKeys[key] then
                 seenKeys[key] = true
 
-                -- Itemname aus Betreff extrahieren
-                -- TBC-Format: "[Itemname]" oder als Klartext
                 local item = nil
                 if subject then
                     item = subject:match("%[(.-)%]") or StripLinks(subject)
@@ -237,7 +255,6 @@ local function ScanMailbox()
                 local priceStr = FormatMoney(money)
 
                 if item and item ~= "" then
-                    -- Vorhandenen preislosen Eintrag anreichern (kein neuer Eintrag)
                     if EnrichEntryPrice(item, priceStr) then
                         refreshUI = true
                     end
@@ -288,11 +305,40 @@ local function CreateMainFrame()
         AHSalesLogDB.framePos = { point = point, x = x, y = y }
     end)
 
+    -- Tab-Buttons
+    local tabTop = -28
+
+    local btnSold = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    btnSold:SetSize(120, TAB_H)
+    btnSold:SetPoint("TOPLEFT", f, "TOPLEFT", PAD, tabTop)
+    btnSold:SetText("Verkauft")
+    btnSold:SetScript("OnClick", function()
+        activeTab = "sold"
+        UpdateTabStyle()
+        AHSalesLog_RefreshList()
+    end)
+    tabBtnSold = btnSold
+
+    local btnListed = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    btnListed:SetSize(120, TAB_H)
+    btnListed:SetPoint("LEFT", btnSold, "RIGHT", 4, 0)
+    btnListed:SetText("Eingestellt")
+    btnListed:SetScript("OnClick", function()
+        activeTab = "listed"
+        UpdateTabStyle()
+        AHSalesLog_RefreshList()
+    end)
+    tabBtnListed = btnListed
+
+    UpdateTabStyle()
+
     -- Spaltenüberschriften
+    local headerTop = tabTop - TAB_H - 2
+
     local headerBg = f:CreateTexture(nil, "BACKGROUND")
     headerBg:SetColorTexture(0, 0, 0, 0.5)
-    headerBg:SetPoint("TOPLEFT",  f, "TOPLEFT",  PAD,       -28)
-    headerBg:SetPoint("TOPRIGHT", f, "TOPRIGHT", -(PAD+20), -28)
+    headerBg:SetPoint("TOPLEFT",  f, "TOPLEFT",  PAD,       headerTop)
+    headerBg:SetPoint("TOPRIGHT", f, "TOPRIGHT", -(PAD+20), headerTop)
     headerBg:SetHeight(HEADER_H)
 
     local function MakeHeader(text, leftOffset)
@@ -307,11 +353,11 @@ local function CreateMainFrame()
 
     -- ScrollFrame
     local sf = CreateFrame("ScrollFrame", "AHSalesLogScrollFrame", f, "UIPanelScrollFrameTemplate")
-    sf:SetPoint("TOPLEFT",     f, "TOPLEFT",  PAD,       -28 - HEADER_H)
+    sf:SetPoint("TOPLEFT",     f, "TOPLEFT",  PAD,       headerTop - HEADER_H)
     sf:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -(PAD+20), 30)
 
     local sc = CreateFrame("Frame", "AHSalesLogScrollChild", sf)
-    sc:SetWidth(FRAME_WIDTH - PAD - (PAD + 20))  -- = 364
+    sc:SetWidth(FRAME_WIDTH - PAD - (PAD + 20))
     sc:SetHeight(1)
     sf:SetScrollChild(sc)
     scrollChild = sc
@@ -322,7 +368,11 @@ local function CreateMainFrame()
     clearBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", PAD, 6)
     clearBtn:SetText("Leeren")
     clearBtn:SetScript("OnClick", function()
-        AHSalesLogDB.entries = {}
+        if activeTab == "sold" then
+            AHSalesLogDB.entries = {}
+        else
+            AHSalesLogDB.pendingAuctions = {}
+        end
         AHSalesLog_RefreshList()
     end)
 
@@ -339,14 +389,20 @@ end
 -- ============================================================
 
 function AHSalesLog_RefreshList()
-    local entries = AHSalesLogDB.entries
-    local count   = #entries
+    local data
+    if activeTab == "sold" then
+        data = AHSalesLogDB.entries
+    else
+        data = AHSalesLogDB.pendingAuctions
+    end
+
+    local count = #data
 
     for _, row in ipairs(rowFrames) do row:Hide() end
 
     scrollChild:SetHeight(math.max(count * ROW_HEIGHT + 4, 1))
 
-    for i, entry in ipairs(entries) do
+    for i, entry in ipairs(data) do
         local row = rowFrames[i]
         if not row then
             row = CreateFrame("Frame", nil, scrollChild)
@@ -397,19 +453,28 @@ function AHSalesLog_RefreshList()
             row.bg:SetColorTexture(0, 0, 0, 0)
         end
 
-        row.fullItem  = entry.item
-        row.fullPrice = entry.price
-        row.fullTime  = entry.time
+        -- Daten je nach Tab auslesen
+        local displayTime  = entry.time or ""
+        local displayItem  = entry.item or ""
+        local displayPrice = entry.priceStr or entry.price or ""
 
-        row.ts:SetText(entry.time)
+        row.fullItem  = displayItem
+        row.fullPrice = displayPrice
+        row.fullTime  = displayTime
+
+        row.ts:SetText(displayTime)
         row.ts:SetTextColor(0.6, 0.6, 0.6)
-        row.item:SetText(entry.item)
+        row.item:SetText(displayItem)
         row.item:SetTextColor(1, 0.82, 0)
-        if entry.price ~= "" then
-            row.price:SetText(entry.price)
-            row.price:SetTextColor(0.4, 1, 0.4)
+        if displayPrice ~= "" then
+            row.price:SetText(displayPrice)
+            if activeTab == "sold" then
+                row.price:SetTextColor(0.4, 1, 0.4)
+            else
+                row.price:SetTextColor(1, 0.82, 0)
+            end
         else
-            row.price:SetText("–")
+            row.price:SetText("--")
             row.price:SetTextColor(0.5, 0.5, 0.5)
         end
     end
@@ -543,10 +608,8 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         AHSalesLogFrame:ClearAllPoints()
         AHSalesLogFrame:SetPoint(pos.point, UIParent, pos.point, pos.x, pos.y)
 
-        -- Chat-Filter registrieren (empfängt formatierte Nachrichten inkl. Itemname)
         ChatFrame_AddMessageEventFilter("CHAT_MSG_SYSTEM", AHSalesLog_ChatFilter)
 
-        -- PostAuction hooken um Listungspreis zu merken
         HookPostAuction()
 
         SLASH_AHSALESLOG1 = "/ahlog"
@@ -555,11 +618,37 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
 
         SLASH_AHSALESLOGTEST1 = "/ahlogtest"
         SlashCmdList["AHSALESLOGTEST"] = function()
-            AddEntry("Schattenpanzerhelm", "5g 32s 10c")
-            print("|cff00ff00AHSalesLog:|r Testeintrag hinzugefügt.")
+            -- Simuliere: Item einstellen + verkaufen
+            table.insert(AHSalesLogDB.pendingAuctions, 1, {
+                item     = "Schattenpanzerhelm",
+                buyout   = 53210,
+                priceStr = "5g 32s 10c",
+                count    = 1,
+                posted   = time(),
+                time     = GetTimestamp(),
+            })
+            AddEntry("Schattenpanzerhelm", FindPendingPrice("Schattenpanzerhelm"))
+            print("|cff00ff00AHSalesLog:|r Testeintrag hinzugefügt (Eingestellt -> Verkauft).")
         end
 
-        print("|cff00ff00AHSalesLog|r geladen.  /ahlog  /ahlogtest")
+        SLASH_AHSALESLOGTEST2 = "/ahlogtest2"
+        SlashCmdList["AHSALESLOGTEST2"] = function()
+            -- Simuliere: nur Item einstellen (bleibt im "Eingestellt"-Tab)
+            table.insert(AHSalesLogDB.pendingAuctions, 1, {
+                item     = "Tigeraugenfell",
+                buyout   = 120000,
+                priceStr = "12g",
+                count    = 1,
+                posted   = time(),
+                time     = GetTimestamp(),
+            })
+            if AHSalesLogFrame and AHSalesLogFrame:IsShown() then
+                AHSalesLog_RefreshList()
+            end
+            print("|cff00ff00AHSalesLog:|r Testeintrag im 'Eingestellt'-Tab hinzugefügt.")
+        end
+
+        print("|cff00ff00AHSalesLog|r geladen.  /ahlog  /ahlogtest  /ahlogtest2")
 
     elseif event == "MAIL_INBOX_UPDATE" then
         ScanMailbox()
