@@ -7,14 +7,16 @@
 -- ============================================================
 
 local ADDON_NAME = "AHSalesLog"
-local ADDON_VERSION = "1.5.0"
+local ADDON_VERSION = "1.6.0"
 local MAX_ENTRIES = 200
+local MAIL_DELAY = 3600  -- 1 Stunde bis Mail ankommt
 
-local COL_TS    = 80
-local COL_ITEM  = 185
-local COL_PRICE = 95
+local COL_TS    = 70
+local COL_ITEM  = 150
+local COL_PRICE = 80
+local COL_TIMER = 55
 
-local FRAME_WIDTH  = 400
+local FRAME_WIDTH  = 460
 local FRAME_HEIGHT = 345
 local ROW_HEIGHT   = 18
 local HEADER_H     = 16
@@ -76,6 +78,13 @@ local function FormatMoney(copper)
     return table.concat(parts, " ")
 end
 
+local function FormatTimer(seconds)
+    if seconds <= 0 then return "Bereit" end
+    local m = math.floor(seconds / 60)
+    local s = seconds % 60
+    return string.format("%d:%02d", m, s)
+end
+
 -- Itemlinks und Farbcodes entfernen
 local function StripLinks(s)
     return s:gsub("|c%x%x%x%x%x%x%x%x", "")
@@ -119,11 +128,13 @@ end
 -- Eintrag hinzufügen / Preis nachträglich setzen
 -- ============================================================
 
-local function AddEntry(item, price)
+local function AddEntry(item, price, buyoutCopper)
     table.insert(AHSalesLogDB.entries, 1, {
-        time  = GetTimestamp(),
-        item  = item,
-        price = price or "",
+        time   = GetTimestamp(),
+        item   = item,
+        price  = price or "",
+        buyout = buyoutCopper or 0,
+        soldAt = time(),
     })
     while #AHSalesLogDB.entries > MAX_ENTRIES do
         table.remove(AHSalesLogDB.entries)
@@ -152,28 +163,25 @@ end
 -- Pending-Auktionen: Preis beim Einstellen merken
 -- ============================================================
 
--- Sucht in der pending-Liste nach dem Item und gibt den Buyout-Preis zurück.
+-- Sucht in der pending-Liste nach dem Item und gibt Preis-String + Copper zurück.
 -- Entfernt den Eintrag bei Treffer (FIFO).
 local function FindPendingPrice(itemName)
     local pending = AHSalesLogDB.pendingAuctions
     for i, entry in ipairs(pending) do
         if entry.item == itemName then
             local priceStr = entry.priceStr or FormatMoney(entry.buyout)
+            local copper   = entry.buyout or 0
             table.remove(pending, i)
             if AHSalesLogFrame and AHSalesLogFrame:IsShown() and activeTab == "listed" then
                 AHSalesLog_RefreshList()
             end
-            return priceStr
+            return priceStr, copper
         end
     end
-    return nil
+    return nil, 0
 end
 
 -- Slot-Monitor: Erfasst Item-Info und Buyout-Preis wenn eine Auktion erstellt wird.
--- Funktioniert unabhängig vom konkreten API-Funktionsnamen.
--- Ablauf:
---   1. NEW_AUCTION_UPDATE: Item im Slot -> Name + Buyout aus UI merken
---   2. NEW_AUCTION_UPDATE: Slot leer + kein Item am Cursor -> Auktion wurde erstellt
 local pendingSellName  = nil
 local pendingSellCount = nil
 local pendingSellBuyout = 0
@@ -211,18 +219,12 @@ local function OnAuctionSlotChanged()
     local name, _, count = GetAuctionSellItemInfo()
 
     if name then
-        -- Item wurde in den Sell-Slot gelegt -> merken
         pendingSellName  = name
         pendingSellCount = count
     elseif pendingSellName then
-        -- Slot ist jetzt leer und wir hatten ein Item gemerkt.
-        -- Prüfe ob das Item am Cursor hängt (= Spieler hat es zurückgenommen)
         local cursorType = GetCursorInfo()
         if cursorType ~= "item" then
-            -- Nicht am Cursor = Auktion wurde erfolgreich erstellt
             local buyout = ReadBuyoutFromUI()
-            -- Buyout könnte nach dem Posten schon 0 sein;
-            -- nutze den zuletzt gespeicherten Wert als Fallback
             if buyout == 0 then buyout = pendingSellBuyout end
             AddPendingAuction(pendingSellName, pendingSellCount, buyout)
         end
@@ -232,8 +234,7 @@ local function OnAuctionSlotChanged()
     end
 end
 
--- Polling: speichert den Buyout-Preis regelmäßig solange ein Item im Slot liegt,
--- damit wir den Wert noch haben falls das UI-Feld nach dem Posten geleert wird.
+-- Polling: speichert den Buyout-Preis regelmäßig solange ein Item im Slot liegt
 local pollFrame = CreateFrame("Frame")
 pollFrame:Hide()
 local pollElapsed = 0
@@ -252,9 +253,6 @@ end)
 -- Chat-Filter: sofortige Erkennung mit Itemname
 -- ============================================================
 
--- UTF-8 Hinweis: "Käufer" / "für" enthalten Umlaute (2 Bytes in UTF-8).
--- Lua-Pattern "." matcht nur 1 Byte. Daher suchen wir nach "gefunden: ".
-
 local function AHSalesLog_ChatFilter(_, _, msg)
     local item = msg:match("gefunden: (.-)%s*$")
                  or msg:match("found for your auction of (.-)%s*$")
@@ -265,8 +263,8 @@ local function AHSalesLog_ChatFilter(_, _, msg)
             lastFilterMsg  = msg
             lastFilterTime = now
             local cleanName = StripLinks(item)
-            local priceStr  = FindPendingPrice(cleanName)
-            AddEntry(cleanName, priceStr)
+            local priceStr, copper = FindPendingPrice(cleanName)
+            AddEntry(cleanName, priceStr, copper)
         end
     end
 
@@ -404,10 +402,12 @@ local function CreateMainFrame()
         lbl:SetPoint("LEFT", headerBg, "LEFT", leftOffset, 0)
         lbl:SetTextColor(0.9, 0.85, 0.3)
         lbl:SetText(text)
+        return lbl
     end
     MakeHeader("Zeit",  2)
     MakeHeader("Item",  2 + COL_TS + 4)
     MakeHeader("Preis", 2 + COL_TS + 4 + COL_ITEM + 4)
+    f.headerTimer = MakeHeader("Post", 2 + COL_TS + 4 + COL_ITEM + 4 + COL_PRICE + 4)
 
     -- ScrollFrame
     local sf = CreateFrame("ScrollFrame", "AHSalesLogScrollFrame", f, "UIPanelScrollFrameTemplate")
@@ -434,6 +434,12 @@ local function CreateMainFrame()
         AHSalesLog_RefreshList()
     end)
 
+    -- Summe-Label (links neben Count)
+    local sumLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    sumLabel:SetPoint("LEFT", clearBtn, "RIGHT", 8, 0)
+    sumLabel:SetTextColor(0.4, 1, 0.4)
+    f.sumLabel = sumLabel
+
     local countLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     countLabel:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -(PAD+20), 10)
     countLabel:SetTextColor(0.6, 0.6, 0.6)
@@ -455,10 +461,23 @@ function AHSalesLog_RefreshList()
     end
 
     local count = #data
+    local isSold = (activeTab == "sold")
+
+    -- Timer-Header nur im Verkauft-Tab zeigen
+    if AHSalesLogFrame and AHSalesLogFrame.headerTimer then
+        if isSold then
+            AHSalesLogFrame.headerTimer:Show()
+        else
+            AHSalesLogFrame.headerTimer:Hide()
+        end
+    end
 
     for _, row in ipairs(rowFrames) do row:Hide() end
 
     scrollChild:SetHeight(math.max(count * ROW_HEIGHT + 4, 1))
+
+    local now = time()
+    local totalCopper = 0
 
     for i, entry in ipairs(data) do
         local row = rowFrames[i]
@@ -484,6 +503,11 @@ function AHSalesLog_RefreshList()
             row.price:SetPoint("LEFT", row.item, "RIGHT", 4, 0)
             row.price:SetWidth(COL_PRICE)
             row.price:SetJustifyH("LEFT")
+
+            row.timer = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.timer:SetPoint("LEFT", row.price, "RIGHT", 4, 0)
+            row.timer:SetWidth(COL_TIMER)
+            row.timer:SetJustifyH("CENTER")
 
             row:SetScript("OnEnter", function(self)
                 if self.fullItem and self.fullItem ~= "" then
@@ -511,7 +535,6 @@ function AHSalesLog_RefreshList()
             row.bg:SetColorTexture(0, 0, 0, 0)
         end
 
-        -- Daten je nach Tab auslesen
         local displayTime  = entry.time or ""
         local displayItem  = entry.item or ""
         local displayPrice = entry.priceStr or entry.price or ""
@@ -526,7 +549,7 @@ function AHSalesLog_RefreshList()
         row.item:SetTextColor(1, 0.82, 0)
         if displayPrice ~= "" then
             row.price:SetText(displayPrice)
-            if activeTab == "sold" then
+            if isSold then
                 row.price:SetTextColor(0.4, 1, 0.4)
             else
                 row.price:SetTextColor(1, 0.82, 0)
@@ -535,12 +558,78 @@ function AHSalesLog_RefreshList()
             row.price:SetText("--")
             row.price:SetTextColor(0.5, 0.5, 0.5)
         end
+
+        -- Timer (nur Verkauft-Tab)
+        if isSold then
+            row.timer:Show()
+            local soldAt = entry.soldAt or 0
+            local remaining = MAIL_DELAY - (now - soldAt)
+            row.timer:SetText(FormatTimer(remaining))
+            if remaining <= 0 then
+                row.timer:SetTextColor(0.4, 1, 0.4)
+            else
+                row.timer:SetTextColor(1, 0.6, 0.2)
+            end
+        else
+            row.timer:Hide()
+        end
+
+        -- Summe berechnen
+        local copper = entry.buyout or 0
+        if copper > 0 then
+            totalCopper = totalCopper + copper
+        end
     end
 
-    if AHSalesLogFrame and AHSalesLogFrame.countLabel then
-        AHSalesLogFrame.countLabel:SetText(count .. " Eintr.")
+    if AHSalesLogFrame then
+        if AHSalesLogFrame.countLabel then
+            AHSalesLogFrame.countLabel:SetText(count .. " Eintr.")
+        end
+        if AHSalesLogFrame.sumLabel then
+            if totalCopper > 0 then
+                AHSalesLogFrame.sumLabel:SetText("Summe: " .. FormatMoney(totalCopper))
+                if isSold then
+                    AHSalesLogFrame.sumLabel:SetTextColor(0.4, 1, 0.4)
+                else
+                    AHSalesLogFrame.sumLabel:SetTextColor(1, 0.82, 0)
+                end
+            else
+                AHSalesLogFrame.sumLabel:SetText("")
+            end
+        end
     end
 end
+
+-- ============================================================
+-- Timer-Update: aktualisiert die Timer-Spalte jede Sekunde
+-- ============================================================
+
+local timerFrame = CreateFrame("Frame")
+local timerElapsed = 0
+timerFrame:SetScript("OnUpdate", function(self, elapsed)
+    timerElapsed = timerElapsed + elapsed
+    if timerElapsed < 1 then return end
+    timerElapsed = 0
+
+    if not AHSalesLogFrame or not AHSalesLogFrame:IsShown() then return end
+    if activeTab ~= "sold" then return end
+
+    local now = time()
+    local entries = AHSalesLogDB.entries
+    for i, entry in ipairs(entries) do
+        local row = rowFrames[i]
+        if row and row:IsShown() and row.timer then
+            local soldAt = entry.soldAt or 0
+            local remaining = MAIL_DELAY - (now - soldAt)
+            row.timer:SetText(FormatTimer(remaining))
+            if remaining <= 0 then
+                row.timer:SetTextColor(0.4, 1, 0.4)
+            else
+                row.timer:SetTextColor(1, 0.6, 0.2)
+            end
+        end
+    end
+end)
 
 -- ============================================================
 -- Minimap-Button
@@ -677,7 +766,6 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
 
         SLASH_AHSALESLOGTEST1 = "/ahlogtest"
         SlashCmdList["AHSALESLOGTEST"] = function()
-            -- Simuliere: Item einstellen + verkaufen
             table.insert(AHSalesLogDB.pendingAuctions, 1, {
                 item     = "Schattenpanzerhelm",
                 buyout   = 53210,
@@ -686,13 +774,13 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
                 posted   = time(),
                 time     = GetTimestamp(),
             })
-            AddEntry("Schattenpanzerhelm", FindPendingPrice("Schattenpanzerhelm"))
-            print("|cff00ff00AHSalesLog:|r Testeintrag hinzugefügt (Eingestellt -> Verkauft).")
+            local priceStr, copper = FindPendingPrice("Schattenpanzerhelm")
+            AddEntry("Schattenpanzerhelm", priceStr, copper)
+            print("|cff00ff00AHSalesLog:|r Testeintrag (Eingestellt -> Verkauft).")
         end
 
         SLASH_AHSALESLOGTEST2 = "/ahlogtest2"
         SlashCmdList["AHSALESLOGTEST2"] = function()
-            -- Simuliere: nur Item einstellen (bleibt im "Eingestellt"-Tab)
             table.insert(AHSalesLogDB.pendingAuctions, 1, {
                 item     = "Tigeraugenfell",
                 buyout   = 120000,
@@ -704,7 +792,7 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
             if AHSalesLogFrame and AHSalesLogFrame:IsShown() then
                 AHSalesLog_RefreshList()
             end
-            print("|cff00ff00AHSalesLog:|r Testeintrag im 'Eingestellt'-Tab hinzugefügt.")
+            print("|cff00ff00AHSalesLog:|r Testeintrag im 'Eingestellt'-Tab.")
         end
 
         SLASH_AHSALESLOGDEBUG1 = "/ahlogdebug"
@@ -718,7 +806,6 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
             print("  Gespeicherter Buyout: " .. FormatMoney(pendingSellBuyout))
             print("  Pending Auctions: " .. #AHSalesLogDB.pendingAuctions)
             print("  Sold Entries: " .. #AHSalesLogDB.entries)
-            -- Aktuellen Sell-Slot live auslesen
             if GetAuctionSellItemInfo then
                 local n = GetAuctionSellItemInfo()
                 print("  Slot LIVE: " .. (n or "leer"))
