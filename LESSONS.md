@@ -98,6 +98,50 @@ Event für Postfach-Daten bereit: **`MAIL_INBOX_UPDATE`** (nicht MAIL_SHOW, da D
 
 ---
 
+## Auktions-Erstellung erkennen (Slot-Monitor)
+
+**Problem:** `StartAuction()` und `PostAuction()` sind in TBC Classic Anniversary **nicht hookbar**
+via `hooksecurefunc`. Weder `StartAuction` noch `PostAuction` existieren als globale Funktionen
+zur Laufzeit (auch nicht nach `AUCTION_HOUSE_SHOW`). Das Blizzard AH-UI ist ein
+Load-on-Demand Addon, aber die Posting-Funktion ist trotzdem nicht zugänglich.
+
+**Lösung: Slot-Monitor via `NEW_AUCTION_UPDATE`**
+
+Das Event `NEW_AUCTION_UPDATE` feuert zuverlässig wenn:
+1. Ein Item in den Auktions-Sell-Slot gelegt wird
+2. Der Sell-Slot geleert wird (nach Posten ODER Zurücknehmen)
+
+Ablauf:
+```lua
+-- 1. Item im Slot → Name + Count merken
+local name, _, count = GetAuctionSellItemInfo()
+pendingSellName = name
+
+-- 2. Buyout-Preis per Polling aus dem UI-Eingabefeld lesen (alle 0.2s)
+--    BuyoutPrice ist ein MoneyInputFrame, der nach dem Posten geleert werden kann
+local buyout = MoneyInputFrame_GetCopper(BuyoutPrice)
+
+-- 3. Slot leer + kein Item am Cursor → Auktion wurde erstellt
+local cursorType = GetCursorInfo()
+if cursorType ~= "item" then
+    -- Erfolgreich gepostet → pendingSellBuyout als Fallback nutzen
+end
+```
+
+**Wichtig:**
+- `BuyoutPrice` (MoneyInputFrame) kann nach dem Posten **sofort geleert** werden → daher den
+  Wert per OnUpdate-Polling kontinuierlich zwischenspeichern
+- `GetCursorInfo() == "item"` unterscheidet Zurücknehmen vs. erfolgreiches Posten
+- `AUCTION_HOUSE_SHOW` / `AUCTION_HOUSE_CLOSED` zum Aktivieren/Deaktivieren des Pollings
+
+**Was NICHT funktioniert:**
+- `hooksecurefunc("StartAuction", ...)` — Funktion existiert nicht als Global
+- `hooksecurefunc("PostAuction", ...)` — ebenfalls nicht vorhanden
+- `HookScript("OnClick")` auf den Create-Button — feuert NACH dem Original-Handler,
+  also nachdem `StartAuction` das Item bereits verbraucht hat (Timing-Problem)
+
+---
+
 ## Projektverlauf
 
 ### v1 – Grundfunktion
@@ -120,3 +164,16 @@ Event für Postfach-Daten bereit: **`MAIL_INBOX_UPDATE`** (nicht MAIL_SHOW, da D
 - Pattern auf `"gefunden: (.-)%s*$"` geändert → funktioniert ✓
 - MAIL_INBOX_UPDATE für nachträgliche Preisanreicherung
 - Postfach nur zum Preis-Enrichment, keine neuen Einträge vom Postfach
+
+### v1.2–1.4 – Listungspreis-Tracking (fehlgeschlagene Ansätze)
+- Versuch: `hooksecurefunc("PostAuction", ...)` → Funktion existiert nicht
+- Versuch: `hooksecurefunc("StartAuction", ...)` → existiert ebenfalls nicht
+- Versuch: Hook erst bei `AUCTION_HOUSE_SHOW` registrieren → StartAuction trotzdem nicht da
+- Versuch: `HookScript("OnClick")` auf Create-Button → feuert nach dem Handler (zu spät)
+
+### v1.5 – Slot-Monitor (funktioniert!)
+- `NEW_AUCTION_UPDATE` + `GetAuctionSellItemInfo()` für Item-Name
+- `MoneyInputFrame_GetCopper(BuyoutPrice)` per Polling für Sofortkaufpreis
+- `GetCursorInfo()` zum Unterscheiden: Zurücknehmen vs. erfolgreiches Posten
+- Zwei-Tab-UI: "Eingestellt" (pending) + "Verkauft" (sold)
+- Item wandert bei Verkauf automatisch von einem Tab in den anderen
