@@ -7,7 +7,7 @@
 -- ============================================================
 
 local ADDON_NAME = "AHSalesLog"
-local ADDON_VERSION = "1.6.0"
+local ADDON_VERSION = "1.8.0"
 local MAX_ENTRIES = 200
 local MAIL_DELAY = 3600  -- 1 Stunde bis Mail ankommt
 
@@ -128,13 +128,14 @@ end
 -- Eintrag hinzufügen / Preis nachträglich setzen
 -- ============================================================
 
-local function AddEntry(item, price, buyoutCopper)
+local function AddEntry(item, price, buyoutCopper, itemCount)
     table.insert(AHSalesLogDB.entries, 1, {
         time   = GetTimestamp(),
         item   = item,
         price  = price or "",
         buyout = buyoutCopper or 0,
         soldAt = time(),
+        count  = itemCount or 1,
     })
     while #AHSalesLogDB.entries > MAX_ENTRIES do
         table.remove(AHSalesLogDB.entries)
@@ -171,11 +172,12 @@ local function FindPendingPrice(itemName)
         if entry.item == itemName then
             local priceStr = entry.priceStr or FormatMoney(entry.buyout)
             local copper   = entry.buyout or 0
+            local count    = entry.count or 1
             table.remove(pending, i)
             if AHSalesLogFrame and AHSalesLogFrame:IsShown() and activeTab == "listed" then
                 AHSalesLog_RefreshList()
             end
-            return priceStr, copper
+            return priceStr, copper, count
         end
     end
     return nil, 0
@@ -224,9 +226,12 @@ local function OnAuctionSlotChanged()
     elseif pendingSellName then
         local cursorType = GetCursorInfo()
         if cursorType ~= "item" then
-            local buyout = ReadBuyoutFromUI()
-            if buyout == 0 then buyout = pendingSellBuyout end
-            AddPendingAuction(pendingSellName, pendingSellCount, buyout)
+            -- Auctionator handled dieses Posting bereits → Slot-Monitor überspringen
+            if (GetTime() - lastAuctionatorPostTime) > 2.0 then
+                local buyout = ReadBuyoutFromUI()
+                if buyout == 0 then buyout = pendingSellBuyout end
+                AddPendingAuction(pendingSellName, pendingSellCount, buyout)
+            end
         end
         pendingSellName  = nil
         pendingSellCount = nil
@@ -250,6 +255,41 @@ pollFrame:SetScript("OnUpdate", function(self, elapsed)
 end)
 
 -- ============================================================
+-- Auctionator-Kompatibilität
+-- ============================================================
+
+local lastAuctionatorPostTime = 0
+
+local function TryRegisterAuctionator()
+    if not Auctionator or not Auctionator.EventBus or not Auctionator.Selling or not Auctionator.Selling.Events then
+        return false
+    end
+
+    local listener = {}
+    function listener:ReceiveEvent(eventName, details)
+        if eventName == Auctionator.Selling.Events.PostSuccessful then
+            local itemLink = details.itemInfo and details.itemInfo.itemLink or nil
+            if not itemLink then return end
+            local itemName = StripLinks(itemLink)
+            if not itemName or itemName == "" then return end
+
+            local numStacks = details.numStacksReached or details.numStacks or 1
+            local stackSize = details.stackSize or 1
+            local buyout    = details.buyoutPrice or 0
+
+            for s = 1, numStacks do
+                AddPendingAuction(itemName, stackSize, buyout)
+            end
+
+            lastAuctionatorPostTime = GetTime()
+        end
+    end
+
+    Auctionator.EventBus:Register(listener, { Auctionator.Selling.Events.PostSuccessful })
+    return true
+end
+
+-- ============================================================
 -- Chat-Filter: sofortige Erkennung mit Itemname
 -- ============================================================
 
@@ -263,8 +303,8 @@ local function AHSalesLog_ChatFilter(_, _, msg)
             lastFilterMsg  = msg
             lastFilterTime = now
             local cleanName = StripLinks(item)
-            local priceStr, copper = FindPendingPrice(cleanName)
-            AddEntry(cleanName, priceStr, copper)
+            local priceStr, copper, count = FindPendingPrice(cleanName)
+            AddEntry(cleanName, priceStr, copper, count)
         end
     end
 
@@ -537,6 +577,10 @@ function AHSalesLog_RefreshList()
 
         local displayTime  = entry.time or ""
         local displayItem  = entry.item or ""
+        local entryCount   = entry.count or 1
+        if entryCount > 1 then
+            displayItem = displayItem .. " x" .. entryCount
+        end
         local displayPrice = entry.priceStr or entry.price or ""
 
         row.fullItem  = displayItem
@@ -804,6 +848,7 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
             print("  BuyoutPrice Frame: " .. (BuyoutPrice and "vorhanden" or "|cffff0000nicht gefunden|r"))
             print("  Sell-Slot Item: " .. (pendingSellName or "leer"))
             print("  Gespeicherter Buyout: " .. FormatMoney(pendingSellBuyout))
+            print("  Auctionator: " .. (Auctionator and Auctionator.Selling and "erkannt" or "nicht vorhanden"))
             print("  Pending Auctions: " .. #AHSalesLogDB.pendingAuctions)
             print("  Sold Entries: " .. #AHSalesLogDB.entries)
             if GetAuctionSellItemInfo then
@@ -815,11 +860,20 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
             end
         end
 
+        local atrLoaded = TryRegisterAuctionator()
+        if atrLoaded then
+            print("|cff00ff00AHSalesLog|r Auctionator erkannt.")
+        end
+
         print("|cff00ff00AHSalesLog|r v" .. ADDON_VERSION .. " geladen.  /ahlog  /ahlogdebug")
 
     elseif event == "AUCTION_HOUSE_SHOW" then
         ahIsOpen = true
         pollFrame:Show()
+        -- Zweiter Versuch: Auctionator könnte nach uns geladen worden sein
+        if lastAuctionatorPostTime == 0 then
+            TryRegisterAuctionator()
+        end
         pendingSellName  = nil
         pendingSellCount = nil
         pendingSellBuyout = 0
