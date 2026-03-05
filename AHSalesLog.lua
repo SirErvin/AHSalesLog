@@ -7,7 +7,7 @@
 -- ============================================================
 
 local ADDON_NAME = "AHSalesLog"
-local ADDON_VERSION = "1.8.0"
+local ADDON_VERSION = "1.8.1"
 local MAX_ENTRIES = 200
 local MAIL_DELAY = 3600  -- 1 Stunde bis Mail ankommt
 
@@ -87,9 +87,13 @@ end
 
 -- Itemlinks und Farbcodes entfernen
 local function StripLinks(s)
+    -- Schneller Pfad: Item-Name aus [Klammern] extrahieren
+    local bracket = s:match("%[(.-)%]")
+    if bracket and bracket ~= "" then return bracket end
+    -- Fallback: alle Link-Codes entfernen
     return s:gsub("|c%x%x%x%x%x%x%x%x", "")
-             :gsub("|h%[(.-)%]|h", "%1")
              :gsub("|H[^|]+|h", "")
+             :gsub("|h%[(.-)%]|h", "%1")
              :gsub("|h", "")
              :gsub("|r", "")
              :match("^%s*(.-)%s*$")
