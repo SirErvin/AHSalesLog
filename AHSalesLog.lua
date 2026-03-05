@@ -7,7 +7,7 @@
 -- ============================================================
 
 local ADDON_NAME = "AHSalesLog"
-local ADDON_VERSION = "1.3.0"
+local ADDON_VERSION = "1.4.0"
 local MAX_ENTRIES = 200
 
 local COL_TS    = 80
@@ -169,11 +169,10 @@ local function FindPendingPrice(itemName)
     return nil
 end
 
--- Speichert Item-Info, bevor StartAuction aufgerufen wird
--- (nach StartAuction kann GetAuctionSellItemInfo() nil sein)
+-- Item-Info wird vom NEW_AUCTION_UPDATE-Event erfasst, BEVOR StartAuction aufgerufen wird.
 local pendingItemName  = nil
 local pendingItemCount = nil
-local auctionHooked    = false
+local startAuctionHooked = false
 
 local function AddPendingAuction(itemName, itemCount, startPrice, buyoutPrice)
     if not itemName then return end
@@ -195,39 +194,24 @@ local function AddPendingAuction(itemName, itemCount, startPrice, buyoutPrice)
 end
 
 local function HookAuctionHouse()
-    if auctionHooked then return end
-    auctionHooked = true
+    if startAuctionHooked then return end
 
-    -- Methode 1: StartAuction hooken (funktioniert wenn die Funktion existiert)
+    -- StartAuction hooken: wird aufgerufen wenn der Spieler "Auktion erstellen" klickt.
+    -- Item-Info liegt zu diesem Zeitpunkt bereits in pendingItemName vor
+    -- (erfasst durch NEW_AUCTION_UPDATE).
     if StartAuction then
         hooksecurefunc("StartAuction", function(startPrice, buyoutPrice, duration)
             -- Versuche Item-Info direkt zu lesen (manchmal noch verfügbar)
-            local name, _, count = GetAuctionSellItemInfo()
-            -- Fallback: vorher gespeicherte Info vom Button-Hook
+            local name, _, count
+            if GetAuctionSellItemInfo then
+                name, _, count = GetAuctionSellItemInfo()
+            end
+            -- Fallback: vorher durch NEW_AUCTION_UPDATE gespeicherte Info
             name  = name  or pendingItemName
             count = count or pendingItemCount
             AddPendingAuction(name, count, startPrice, buyoutPrice)
-            pendingItemName  = nil
-            pendingItemCount = nil
         end)
-    end
-
-    -- Methode 2: Create-Auction-Button hooken (Fallback + Item-Info vorher erfassen)
-    if AuctionsCreateAuctionButton then
-        AuctionsCreateAuctionButton:HookScript("OnClick", function()
-            -- Item-Info erfassen bevor StartAuction das Item verbraucht
-            local name, _, count = GetAuctionSellItemInfo()
-            if name then
-                pendingItemName  = name
-                pendingItemCount = count
-                -- Falls StartAuction nicht existiert, direkt speichern
-                if not StartAuction then
-                    local startPrice  = MoneyInputFrame_GetCopper(StartPrice) or 0
-                    local buyoutPrice = MoneyInputFrame_GetCopper(BuyoutPrice) or 0
-                    AddPendingAuction(name, count, startPrice, buyoutPrice)
-                end
-            end
-        end)
+        startAuctionHooked = true
     end
 end
 
@@ -278,10 +262,11 @@ local function ScanMailbox()
     local refreshUI = false
 
     for i = 1, numItems do
-        local _, _, sender, subject, money = GetInboxHeaderInfo(i)
+        local _, _, sender, subject, money, _, daysLeft = GetInboxHeaderInfo(i)
 
         if IsAHSender(sender) and money and money > 0 then
-            local key = (subject or "") .. "|" .. tostring(money)
+            local dayKey = math.floor((daysLeft or 0) * 100)
+            local key = (subject or "") .. "|" .. tostring(money) .. "|" .. tostring(dayKey)
 
             if not seenKeys[key] then
                 seenKeys[key] = true
@@ -308,9 +293,10 @@ local function ScanMailbox()
     if count > 500 then
         AHSalesLogDB.seenMailKeys = {}
         for i = 1, numItems do
-            local _, _, sender, subject, money = GetInboxHeaderInfo(i)
+            local _, _, sender, subject, money, _, daysLeft = GetInboxHeaderInfo(i)
             if IsAHSender(sender) and money and money > 0 then
-                local key = (subject or "") .. "|" .. tostring(money)
+                local dayKey = math.floor((daysLeft or 0) * 100)
+                local key = (subject or "") .. "|" .. tostring(money) .. "|" .. tostring(dayKey)
                 AHSalesLogDB.seenMailKeys[key] = true
             end
         end
@@ -634,6 +620,7 @@ local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("ADDON_LOADED")
 eventFrame:RegisterEvent("MAIL_INBOX_UPDATE")
 eventFrame:RegisterEvent("AUCTION_HOUSE_SHOW")
+eventFrame:RegisterEvent("NEW_AUCTION_UPDATE")
 
 eventFrame:SetScript("OnEvent", function(self, event, ...)
     if event == "ADDON_LOADED" then
@@ -686,10 +673,32 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
             print("|cff00ff00AHSalesLog:|r Testeintrag im 'Eingestellt'-Tab hinzugefügt.")
         end
 
-        print("|cff00ff00AHSalesLog|r geladen.  /ahlog  /ahlogtest  /ahlogtest2")
+        SLASH_AHSALESLOGDEBUG1 = "/ahlogdebug"
+        SlashCmdList["AHSALESLOGDEBUG"] = function()
+            print("|cff00ff00AHSalesLog Debug:|r")
+            print("  Version: " .. ADDON_VERSION)
+            print("  StartAuction: " .. (StartAuction and "vorhanden" or "|cffff0000nicht gefunden|r"))
+            print("  StartAuction hooked: " .. (startAuctionHooked and "ja" or "|cffff0000nein|r"))
+            print("  GetAuctionSellItemInfo: " .. (GetAuctionSellItemInfo and "vorhanden" or "|cffff0000nicht gefunden|r"))
+            print("  Pending Item (Slot): " .. (pendingItemName or "keins"))
+            print("  Pending Auctions: " .. #AHSalesLogDB.pendingAuctions)
+            print("  Sold Entries: " .. #AHSalesLogDB.entries)
+        end
+
+        print("|cff00ff00AHSalesLog|r v" .. ADDON_VERSION .. " geladen.  /ahlog  /ahlogdebug")
 
     elseif event == "AUCTION_HOUSE_SHOW" then
         HookAuctionHouse()
+
+    elseif event == "NEW_AUCTION_UPDATE" then
+        -- Item wurde in den Auktions-Slot gelegt -> Info erfassen
+        if GetAuctionSellItemInfo then
+            local name, _, count = GetAuctionSellItemInfo()
+            if name then
+                pendingItemName  = name
+                pendingItemCount = count
+            end
+        end
 
     elseif event == "MAIL_INBOX_UPDATE" then
         ScanMailbox()
