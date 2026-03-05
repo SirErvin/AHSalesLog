@@ -57,7 +57,7 @@ local function FormatMoney(copper)
     local parts = {}
     if g > 0 then table.insert(parts, g .. "g") end
     if s > 0 then table.insert(parts, s .. "s") end
-    if c > 0 then table.insert(parts, c .. "k") end
+    if c > 0 then table.insert(parts, c .. "c") end
     return table.concat(parts, " ")
 end
 
@@ -138,7 +138,7 @@ local function AHSalesLog_ChatFilter(_, _, msg)
         local now = GetTime()
         -- Rate-Limiter: selbe Nachricht nicht mehrfach verarbeiten
         -- (Filter feuert einmal pro Chatframe)
-        if msg ~= lastFilterMsg or (now - lastFilterTime) > 1.0 then
+        if msg ~= lastFilterMsg or (now - lastFilterTime) > 0.05 then
             lastFilterMsg  = msg
             lastFilterTime = now
             AddEntry(StripLinks(item), nil)
@@ -170,11 +170,10 @@ local function ScanMailbox()
     local refreshUI = false
 
     for i = 1, numItems do
-        -- packageIcon, stationeryIcon, sender, subject, money, CODAmount, daysLeft, ...
-        local _, _, sender, subject, money, _, daysLeft = GetInboxHeaderInfo(i)
+        local _, _, sender, subject, money = GetInboxHeaderInfo(i)
 
         if IsAHSender(sender) and money and money > 0 then
-            local key = (subject or "") .. "|" .. tostring(money) .. "|" .. tostring(math.floor((daysLeft or 0) * 100))
+            local key = (subject or "") .. "|" .. tostring(money)
 
             if not seenKeys[key] then
                 seenKeys[key] = true
@@ -204,9 +203,9 @@ local function ScanMailbox()
     if count > 500 then
         AHSalesLogDB.seenMailKeys = {}
         for i = 1, numItems do
-            local _, _, sender, subject, money, _, daysLeft = GetInboxHeaderInfo(i)
+            local _, _, sender, subject, money = GetInboxHeaderInfo(i)
             if IsAHSender(sender) and money and money > 0 then
-                local key = (subject or "") .. "|" .. tostring(money) .. "|" .. tostring(math.floor((daysLeft or 0) * 100))
+                local key = (subject or "") .. "|" .. tostring(money)
                 AHSalesLogDB.seenMailKeys[key] = true
             end
         end
@@ -382,7 +381,7 @@ local function SetMinimapPos(btn)
 end
 
 local function CreateMinimapButton()
-    local btn = CreateFrame("Button", "AHSalesLog", Minimap)
+    local btn = CreateFrame("Button", "AHSalesLogMinimapButton", Minimap)
     btn:SetSize(32, 32)
     btn:SetFrameStrata("MEDIUM")
     btn:SetFrameLevel(8)
