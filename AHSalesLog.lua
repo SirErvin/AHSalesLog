@@ -7,7 +7,7 @@
 -- ============================================================
 
 local ADDON_NAME = "AHSalesLog"
-local ADDON_VERSION = "1.10.0"
+local ADDON_VERSION = "1.11.0"
 local MAX_ENTRIES = 200
 local MAIL_DELAY = 3600  -- 1 Stunde bis Mail ankommt
 
@@ -24,10 +24,20 @@ local ICON_COPPER = "|TInterface\\MoneyFrame\\UI-CopperIcon:12|t"
 
 local FRAME_WIDTH  = 460
 local FRAME_HEIGHT = 345
+local MIN_WIDTH    = 400
+local MIN_HEIGHT   = 250
 local ROW_HEIGHT   = 18
 local HEADER_H     = 16
 local TAB_H        = 22
 local PAD          = 8
+
+local FONT_LIST = {
+    { name = "Standard",  path = "GameFontNormalSmall" },
+    { name = "Friz QT",   path = "Fonts\\FRIZQT__.TTF" },
+    { name = "Arial",     path = "Fonts\\ARIALN.TTF" },
+    { name = "Morpheus",  path = "Fonts\\MORPHEUS.TTF" },
+    { name = "Skurri",    path = "Fonts\\skurri.TTF" },
+}
 
 local AHSalesLogFrame = nil
 local scrollChild     = nil
@@ -60,13 +70,19 @@ local function InitDB()
     if not AHSalesLogDB.minimapAngle     then AHSalesLogDB.minimapAngle     = 225 end
     if not AHSalesLogDB.seenMailKeys     then AHSalesLogDB.seenMailKeys     = {} end
     if not AHSalesLogDB.pendingAuctions  then AHSalesLogDB.pendingAuctions  = {} end
-    if not AHSalesLogDB.activeMailSales  then AHSalesLogDB.activeMailSales  = {} end
+    AHSalesLogDB.activeMailSales = nil  -- nicht mehr benötigt
     if not AHSalesLogDB.settings         then AHSalesLogDB.settings         = {} end
     if AHSalesLogDB.settings.autoRemoveOnMail == nil then
         AHSalesLogDB.settings.autoRemoveOnMail = false
     end
     if AHSalesLogDB.settings.allowManualDelete == nil then
         AHSalesLogDB.settings.allowManualDelete = false
+    end
+    if not AHSalesLogDB.settings.fontIndex then
+        AHSalesLogDB.settings.fontIndex = 1
+    end
+    if not AHSalesLogDB.frameSize then
+        AHSalesLogDB.frameSize = { w = FRAME_WIDTH, h = FRAME_HEIGHT }
     end
 
     -- Alte pending-Einträge entfernen (älter als 48h)
@@ -124,6 +140,25 @@ local function FormatTimer(seconds)
     local m = math.floor(seconds / 60)
     local s = seconds % 60
     return string.format("%d:%02d", m, s)
+end
+
+local function GetRowFont()
+    local idx = AHSalesLogDB and AHSalesLogDB.settings and AHSalesLogDB.settings.fontIndex or 1
+    local entry = FONT_LIST[idx]
+    if not entry or entry.name == "Standard" then
+        return nil -- nil = use GameFontNormalSmall (default)
+    end
+    return entry.path
+end
+
+local function ApplyFontToString(fs)
+    local fontPath = GetRowFont()
+    if fontPath then
+        fs:SetFont(fontPath, 11)
+    else
+        local f, s, fl = GameFontNormalSmall:GetFont()
+        fs:SetFont(f, s, fl)
+    end
 end
 
 -- Itemlinks und Farbcodes entfernen
@@ -531,8 +566,6 @@ local function ScanMailbox()
     local numItems = GetInboxNumItems()
 
     local seenKeys  = AHSalesLogDB.seenMailKeys
-    local previousActive = AHSalesLogDB.activeMailSales or {}
-    local currentActive = {}
     local refreshUI = false
 
     for i = 1, numItems do
@@ -546,7 +579,6 @@ local function ScanMailbox()
 
             local dayKey = math.floor((daysLeft or 0) * 100)
             local key = (subject or "") .. "|" .. tostring(money) .. "|" .. tostring(dayKey)
-            currentActive[key] = { item = item, money = money }
 
             if not seenKeys[key] then
                 seenKeys[key] = true
@@ -562,30 +594,47 @@ local function ScanMailbox()
         end
     end
 
-    if AHSalesLogDB.settings.autoRemoveOnMail then
-        for key, info in pairs(previousActive) do
-            if not currentActive[key] then
-                if RemoveOneSoldEntry(info.item, info.money) then
-                    refreshUI = true
-                end
-            end
-        end
-    end
-    AHSalesLogDB.activeMailSales = currentActive
-
     -- seenMailKeys auf max. 500 Einträge begrenzen
     local count = 0
     for _ in pairs(seenKeys) do count = count + 1 end
     if count > 500 then
         AHSalesLogDB.seenMailKeys = {}
-        for key in pairs(currentActive) do
-            AHSalesLogDB.seenMailKeys[key] = true
+        for i = 1, numItems do
+            local _, _, sender, subject, money, _, daysLeft = GetInboxHeaderInfo(i)
+            if IsAHSender(sender) and money and money > 0 then
+                local dayKey = math.floor((daysLeft or 0) * 100)
+                local key = (subject or "") .. "|" .. tostring(money) .. "|" .. tostring(dayKey)
+                AHSalesLogDB.seenMailKeys[key] = true
+            end
         end
     end
 
     if refreshUI and AHSalesLogFrame and AHSalesLogFrame:IsShown() then
         AHSalesLog_RefreshList()
     end
+end
+
+-- TakeInboxMoney Hook: Zuverlässige Erkennung wenn Geld abgeholt wird
+local takeMoneyHooked = false
+local function HookTakeInboxMoney()
+    if takeMoneyHooked or not TakeInboxMoney then return end
+    hooksecurefunc("TakeInboxMoney", function(mailIndex)
+        if not AHSalesLogDB.settings.autoRemoveOnMail then return end
+        local _, _, sender, subject, money = GetInboxHeaderInfo(mailIndex)
+        if not IsAHSender(sender) or not money or money <= 0 then return end
+        local item = nil
+        if subject then
+            item = subject:match("%[(.-)%]") or StripLinks(subject)
+        end
+        if item and item ~= "" then
+            if RemoveOneSoldEntry(item, money) then
+                if AHSalesLogFrame and AHSalesLogFrame:IsShown() then
+                    AHSalesLog_RefreshList()
+                end
+            end
+        end
+    end)
+    takeMoneyHooked = true
 end
 
 -- ============================================================
@@ -608,33 +657,57 @@ end
 
 local function CreateOptionsFrame()
     local f = CreateFrame("Frame", "AHSalesLogOptionsFrame", AHSalesLogFrame, "BasicFrameTemplateWithInset")
-    f:SetSize(380, 170)
+    f:SetSize(380, 210)
     f:SetPoint("TOPLEFT", AHSalesLogFrame, "TOPRIGHT", 8, 0)
     f:SetFrameStrata("DIALOG")
     f:Hide()
 
     f.TitleText:SetText("AH Sales Log Optionen")
 
-    local autoMail = CreateLabeledCheckbox(f, "Verkäufe nach Mail-Abholung automatisch entfernen", 14, -36, function(self)
+    local autoMail = CreateLabeledCheckbox(f, "Verkaufe nach Mail-Abholung automatisch entfernen", 14, -36, function(self)
         AHSalesLogDB.settings.autoRemoveOnMail = self:GetChecked() and true or false
     end)
     f.autoMail = autoMail
 
-    local manualDelete = CreateLabeledCheckbox(f, "Einzelne Einträge per Rechtsklick löschen", 14, -68, function(self)
+    local manualDelete = CreateLabeledCheckbox(f, "Einzelne Eintr\195\164ge per Rechtsklick l\195\182schen", 14, -68, function(self)
         AHSalesLogDB.settings.allowManualDelete = self:GetChecked() and true or false
     end)
     f.manualDelete = manualDelete
 
+    -- Schriftart-Auswahl
+    local fontLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    fontLabel:SetPoint("TOPLEFT", f, "TOPLEFT", 18, -105)
+    fontLabel:SetText("Schriftart:")
+    fontLabel:SetTextColor(1, 1, 1)
+
+    local fontBtnWidth = 140
+    local fontBtn = CreateFrame("Button", "AHSalesLogFontDropdown", f, "UIPanelButtonTemplate")
+    fontBtn:SetSize(fontBtnWidth, 22)
+    fontBtn:SetPoint("LEFT", fontLabel, "RIGHT", 8, 0)
+    f.fontBtn = fontBtn
+
+    fontBtn:SetScript("OnClick", function(self)
+        local currentIdx = AHSalesLogDB.settings.fontIndex or 1
+        local nextIdx = currentIdx % #FONT_LIST + 1
+        AHSalesLogDB.settings.fontIndex = nextIdx
+        self:SetText(FONT_LIST[nextIdx].name)
+        -- Rows neu zeichnen mit neuer Schriftart
+        rowFrames = {}
+        AHSalesLog_RefreshList()
+    end)
+
     local help = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    help:SetPoint("TOPLEFT", f, "TOPLEFT", 18, -102)
+    help:SetPoint("TOPLEFT", f, "TOPLEFT", 18, -138)
     help:SetWidth(340)
     help:SetJustifyH("LEFT")
     help:SetTextColor(0.8, 0.8, 0.8)
-    help:SetText("Hinweis:\nAutomatisch entfernt nur Verkaufe, deren AH-Mail aus dem Postfach verschwunden ist.")
+    help:SetText("Hinweis: Schriftart wird durch Klick durchgeschaltet.\nAuto-Entfernen funktioniert beim Abholen von AH-Geld am Briefkasten.")
 
     f:SetScript("OnShow", function(self)
         self.autoMail:SetChecked(AHSalesLogDB.settings.autoRemoveOnMail)
         self.manualDelete:SetChecked(AHSalesLogDB.settings.allowManualDelete)
+        local idx = AHSalesLogDB.settings.fontIndex or 1
+        self.fontBtn:SetText(FONT_LIST[idx].name)
     end)
 
     optionsFrame = f
@@ -651,8 +724,11 @@ end
 
 local function CreateMainFrame()
     local f = CreateFrame("Frame", "AHSalesLogFrame", UIParent, "BasicFrameTemplateWithInset")
-    f:SetSize(FRAME_WIDTH, FRAME_HEIGHT)
+    local savedSize = AHSalesLogDB.frameSize
+    f:SetSize(savedSize.w, savedSize.h)
     f:SetMovable(true)
+    f:SetResizable(true)
+    f:SetResizeBounds(MIN_WIDTH, MIN_HEIGHT, 800, 600)
     f:EnableMouse(true)
     f:RegisterForDrag("LeftButton")
     f:SetClampedToScreen(true)
@@ -666,6 +742,22 @@ local function CreateMainFrame()
         self:StopMovingOrSizing()
         local point, _, _, x, y = self:GetPoint()
         AHSalesLogDB.framePos = { point = point, x = x, y = y }
+    end)
+
+    -- Resize-Handle unten rechts
+    local resizeBtn = CreateFrame("Button", nil, f)
+    resizeBtn:SetSize(16, 16)
+    resizeBtn:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -2, 2)
+    resizeBtn:SetNormalTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+    resizeBtn:SetHighlightTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Highlight")
+    resizeBtn:SetPushedTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Down")
+    resizeBtn:SetScript("OnMouseDown", function()
+        f:StartSizing("BOTTOMRIGHT")
+    end)
+    resizeBtn:SetScript("OnMouseUp", function()
+        f:StopMovingOrSizing()
+        AHSalesLogDB.frameSize = { w = f:GetWidth(), h = f:GetHeight() }
+        AHSalesLog_RefreshList()
     end)
 
     optionsBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
@@ -710,9 +802,11 @@ local function CreateMainFrame()
     headerBg:SetPoint("TOPRIGHT", f, "TOPRIGHT", -(PAD+20), headerTop)
     headerBg:SetHeight(HEADER_H)
 
-    local function MakeHeader(text, leftOffset)
+    local function MakeHeader(text, leftOffset, width, justify)
         local lbl = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
         lbl:SetPoint("LEFT", headerBg, "LEFT", leftOffset, 0)
+        if width then lbl:SetWidth(width) end
+        lbl:SetJustifyH(justify or "LEFT")
         lbl:SetTextColor(0.9, 0.85, 0.3)
         lbl:SetText(text)
         return lbl
@@ -720,9 +814,9 @@ local function CreateMainFrame()
     local priceStart = 2 + COL_TS + 4 + COL_ITEM + 4
     MakeHeader("Zeit",  2)
     MakeHeader("Item",  2 + COL_TS + 4)
-    MakeHeader(ICON_GOLD,   priceStart)
-    MakeHeader(ICON_SILVER, priceStart + COL_GOLD + 2)
-    MakeHeader(ICON_COPPER, priceStart + COL_GOLD + 2 + COL_SILVER + 2)
+    MakeHeader(ICON_GOLD,   priceStart,                                    COL_GOLD,   "RIGHT")
+    MakeHeader(ICON_SILVER, priceStart + COL_GOLD + 2,                     COL_SILVER, "RIGHT")
+    MakeHeader(ICON_COPPER, priceStart + COL_GOLD + 2 + COL_SILVER + 2,   COL_COPPER, "RIGHT")
     f.headerTimer = MakeHeader("Post", priceStart + COL_GOLD + 2 + COL_SILVER + 2 + COL_COPPER + 4)
 
     -- ScrollFrame
@@ -844,6 +938,14 @@ function AHSalesLog_RefreshList()
             row.timer:SetPoint("LEFT", row.copper, "RIGHT", 4, 0)
             row.timer:SetWidth(COL_TIMER)
             row.timer:SetJustifyH("CENTER")
+
+            -- Custom Font anwenden
+            ApplyFontToString(row.ts)
+            ApplyFontToString(row.item)
+            ApplyFontToString(row.gold)
+            ApplyFontToString(row.silver)
+            ApplyFontToString(row.copper)
+            ApplyFontToString(row.timer)
 
             row:SetScript("OnEnter", function(self)
                 if self.fullItem and self.fullItem ~= "" then
@@ -1112,6 +1214,7 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
 
         InitDB()
         HookCancelAuction()
+        HookTakeInboxMoney()
         CreateMainFrame()
         CreateOptionsFrame()
         CreateMinimapButton()
