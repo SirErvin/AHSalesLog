@@ -7,14 +7,20 @@
 -- ============================================================
 
 local ADDON_NAME = "AHSalesLog"
-local ADDON_VERSION = "1.9.1"
+local ADDON_VERSION = "1.10.0"
 local MAX_ENTRIES = 200
 local MAIL_DELAY = 3600  -- 1 Stunde bis Mail ankommt
 
-local COL_TS    = 70
-local COL_ITEM  = 150
-local COL_PRICE = 80
-local COL_TIMER = 55
+local COL_TS     = 70
+local COL_ITEM   = 140
+local COL_GOLD   = 34
+local COL_SILVER = 28
+local COL_COPPER = 28
+local COL_TIMER  = 55
+
+local ICON_GOLD   = "|TInterface\\MoneyFrame\\UI-GoldIcon:12|t"
+local ICON_SILVER = "|TInterface\\MoneyFrame\\UI-SilverIcon:12|t"
+local ICON_COPPER = "|TInterface\\MoneyFrame\\UI-CopperIcon:12|t"
 
 local FRAME_WIDTH  = 460
 local FRAME_HEIGHT = 345
@@ -91,6 +97,26 @@ local function FormatMoney(copper)
     if s > 0 then table.insert(parts, s .. "s") end
     if c > 0 then table.insert(parts, c .. "c") end
     return table.concat(parts, " ")
+end
+
+local function FormatMoneyIcons(copper)
+    if not copper or copper == 0 then return "" end
+    local g = math.floor(copper / 10000)
+    local s = math.floor((copper % 10000) / 100)
+    local c = copper % 100
+    local parts = {}
+    if g > 0 then table.insert(parts, g .. ICON_GOLD) end
+    if s > 0 then table.insert(parts, s .. ICON_SILVER) end
+    if c > 0 then table.insert(parts, c .. ICON_COPPER) end
+    return table.concat(parts, " ")
+end
+
+local function SplitCopper(copper)
+    if not copper or copper == 0 then return 0, 0, 0 end
+    local g = math.floor(copper / 10000)
+    local s = math.floor((copper % 10000) / 100)
+    local c = copper % 100
+    return g, s, c
 end
 
 local function FormatTimer(seconds)
@@ -571,8 +597,10 @@ local function CreateLabeledCheckbox(parent, text, x, y, onClick)
     cb:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
     cb:SetScript("OnClick", onClick)
 
-    local label = parent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    local label = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     label:SetPoint("LEFT", cb, "RIGHT", 4, 1)
+    label:SetWidth(320)
+    label:SetJustifyH("LEFT")
     label:SetText(text)
     cb.label = label
     return cb
@@ -599,9 +627,10 @@ local function CreateOptionsFrame()
 
     local help = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     help:SetPoint("TOPLEFT", f, "TOPLEFT", 18, -102)
+    help:SetWidth(340)
     help:SetJustifyH("LEFT")
     help:SetTextColor(0.8, 0.8, 0.8)
-    help:SetText("Hinweis:\nAutomatisch entfernt nur Verkäufe, deren AH-Mail aus dem Postfach verschwunden ist.")
+    help:SetText("Hinweis:\nAutomatisch entfernt nur Verkaufe, deren AH-Mail aus dem Postfach verschwunden ist.")
 
     f:SetScript("OnShow", function(self)
         self.autoMail:SetChecked(AHSalesLogDB.settings.autoRemoveOnMail)
@@ -688,10 +717,13 @@ local function CreateMainFrame()
         lbl:SetText(text)
         return lbl
     end
+    local priceStart = 2 + COL_TS + 4 + COL_ITEM + 4
     MakeHeader("Zeit",  2)
     MakeHeader("Item",  2 + COL_TS + 4)
-    MakeHeader("Preis", 2 + COL_TS + 4 + COL_ITEM + 4)
-    f.headerTimer = MakeHeader("Post", 2 + COL_TS + 4 + COL_ITEM + 4 + COL_PRICE + 4)
+    MakeHeader(ICON_GOLD,   priceStart)
+    MakeHeader(ICON_SILVER, priceStart + COL_GOLD + 2)
+    MakeHeader(ICON_COPPER, priceStart + COL_GOLD + 2 + COL_SILVER + 2)
+    f.headerTimer = MakeHeader("Post", priceStart + COL_GOLD + 2 + COL_SILVER + 2 + COL_COPPER + 4)
 
     -- ScrollFrame
     local sf = CreateFrame("ScrollFrame", "AHSalesLogScrollFrame", f, "UIPanelScrollFrameTemplate")
@@ -793,13 +825,23 @@ function AHSalesLog_RefreshList()
             row.item:SetWidth(COL_ITEM)
             row.item:SetJustifyH("LEFT")
 
-            row.price = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-            row.price:SetPoint("LEFT", row.item, "RIGHT", 4, 0)
-            row.price:SetWidth(COL_PRICE)
-            row.price:SetJustifyH("LEFT")
+            row.gold = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.gold:SetPoint("LEFT", row.item, "RIGHT", 4, 0)
+            row.gold:SetWidth(COL_GOLD)
+            row.gold:SetJustifyH("RIGHT")
+
+            row.silver = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.silver:SetPoint("LEFT", row.gold, "RIGHT", 2, 0)
+            row.silver:SetWidth(COL_SILVER)
+            row.silver:SetJustifyH("RIGHT")
+
+            row.copper = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.copper:SetPoint("LEFT", row.silver, "RIGHT", 2, 0)
+            row.copper:SetWidth(COL_COPPER)
+            row.copper:SetJustifyH("RIGHT")
 
             row.timer = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-            row.timer:SetPoint("LEFT", row.price, "RIGHT", 4, 0)
+            row.timer:SetPoint("LEFT", row.copper, "RIGHT", 4, 0)
             row.timer:SetWidth(COL_TIMER)
             row.timer:SetJustifyH("CENTER")
 
@@ -848,6 +890,7 @@ function AHSalesLog_RefreshList()
             displayItem = displayItem .. " x" .. entryCount
         end
         local displayPrice = entry.priceStr or entry.price or ""
+        local copper = entry.buyout or 0
 
         row.fullItem  = displayItem
         row.fullPrice = displayPrice
@@ -858,16 +901,22 @@ function AHSalesLog_RefreshList()
         row.ts:SetTextColor(0.6, 0.6, 0.6)
         row.item:SetText(displayItem)
         row.item:SetTextColor(1, 0.82, 0)
-        if displayPrice ~= "" then
-            row.price:SetText(displayPrice)
-            if isSold then
-                row.price:SetTextColor(0.4, 1, 0.4)
-            else
-                row.price:SetTextColor(1, 0.82, 0)
-            end
+
+        local priceColor
+        if copper > 0 or displayPrice ~= "" then
+            priceColor = isSold and {0.4, 1, 0.4} or {1, 0.82, 0}
         else
-            row.price:SetText("--")
-            row.price:SetTextColor(0.5, 0.5, 0.5)
+            priceColor = {0.5, 0.5, 0.5}
+        end
+        local gVal, sVal, cVal = SplitCopper(copper)
+        row.gold:SetText(gVal > 0 and (gVal .. ICON_GOLD) or "")
+        row.gold:SetTextColor(unpack(priceColor))
+        row.silver:SetText(sVal > 0 and (sVal .. ICON_SILVER) or "")
+        row.silver:SetTextColor(unpack(priceColor))
+        row.copper:SetText(cVal > 0 and (cVal .. ICON_COPPER) or "")
+        row.copper:SetTextColor(unpack(priceColor))
+        if copper == 0 and displayPrice == "" then
+            row.gold:SetText("--")
         end
 
         -- Timer (nur Verkauft-Tab)
@@ -886,7 +935,6 @@ function AHSalesLog_RefreshList()
         end
 
         -- Summe berechnen
-        local copper = entry.buyout or 0
         if copper > 0 then
             totalCopper = totalCopper + copper
         end
@@ -898,7 +946,7 @@ function AHSalesLog_RefreshList()
         end
         if AHSalesLogFrame.sumLabel then
             if totalCopper > 0 then
-                AHSalesLogFrame.sumLabel:SetText("Summe: " .. FormatMoney(totalCopper))
+                AHSalesLogFrame.sumLabel:SetText("Summe: " .. FormatMoneyIcons(totalCopper))
                 if isSold then
                     AHSalesLogFrame.sumLabel:SetTextColor(0.4, 1, 0.4)
                 else
