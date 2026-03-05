@@ -38,7 +38,17 @@ local function InitDB()
     if not AHSalesLogDB.entries      then AHSalesLogDB.entries      = {} end
     if not AHSalesLogDB.framePos     then AHSalesLogDB.framePos     = { point="CENTER", x=0, y=0 } end
     if not AHSalesLogDB.minimapAngle then AHSalesLogDB.minimapAngle = 225 end
-    if not AHSalesLogDB.seenMailKeys then AHSalesLogDB.seenMailKeys = {} end
+    if not AHSalesLogDB.seenMailKeys      then AHSalesLogDB.seenMailKeys      = {} end
+    if not AHSalesLogDB.pendingAuctions   then AHSalesLogDB.pendingAuctions   = {} end
+
+    -- Alte pending-Einträge entfernen (älter als 48h)
+    local now = time()
+    local pending = AHSalesLogDB.pendingAuctions
+    for i = #pending, 1, -1 do
+        if now - (pending[i].posted or 0) > 172800 then
+            table.remove(pending, i)
+        end
+    end
 end
 
 local function GetTimestamp()
@@ -120,6 +130,43 @@ local function EnrichEntryPrice(item, priceStr)
 end
 
 -- ============================================================
+-- Pending-Auktionen: Preis beim Einstellen merken
+-- ============================================================
+
+-- Sucht in der pending-Liste nach dem Item und gibt den Buyout-Preis zurück.
+-- Entfernt den Eintrag bei Treffer (FIFO).
+local function FindPendingPrice(itemName)
+    local pending = AHSalesLogDB.pendingAuctions
+    for i, entry in ipairs(pending) do
+        if entry.item == itemName then
+            local priceStr = FormatMoney(entry.buyout)
+            table.remove(pending, i)
+            return priceStr
+        end
+    end
+    return nil
+end
+
+local function HookPostAuction()
+    hooksecurefunc("PostAuction", function(startPrice, buyoutPrice, duration)
+        local name, _, count = GetAuctionSellItemInfo()
+        if name then
+            local price = buyoutPrice and buyoutPrice > 0 and buyoutPrice or startPrice
+            table.insert(AHSalesLogDB.pendingAuctions, {
+                item   = name,
+                buyout = price,
+                count  = count or 1,
+                posted = time(),
+            })
+            -- Limit auf 200
+            while #AHSalesLogDB.pendingAuctions > 200 do
+                table.remove(AHSalesLogDB.pendingAuctions, 1)
+            end
+        end
+    end)
+end
+
+-- ============================================================
 -- Chat-Filter: sofortige Erkennung mit Itemname
 -- ============================================================
 
@@ -141,7 +188,9 @@ local function AHSalesLog_ChatFilter(_, _, msg)
         if msg ~= lastFilterMsg or (now - lastFilterTime) > 0.05 then
             lastFilterMsg  = msg
             lastFilterTime = now
-            AddEntry(StripLinks(item), nil)
+            local cleanName = StripLinks(item)
+            local priceStr  = FindPendingPrice(cleanName)
+            AddEntry(cleanName, priceStr)
         end
     end
 
@@ -497,13 +546,16 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         -- Chat-Filter registrieren (empfängt formatierte Nachrichten inkl. Itemname)
         ChatFrame_AddMessageEventFilter("CHAT_MSG_SYSTEM", AHSalesLog_ChatFilter)
 
+        -- PostAuction hooken um Listungspreis zu merken
+        HookPostAuction()
+
         SLASH_AHSALESLOG1 = "/ahlog"
         SLASH_AHSALESLOG2 = "/ahsaleslog"
         SlashCmdList["AHSALESLOG"] = ToggleFrame
 
         SLASH_AHSALESLOGTEST1 = "/ahlogtest"
         SlashCmdList["AHSALESLOGTEST"] = function()
-            AddEntry("Schattenpanzerhelm", "5g 32s 10k")
+            AddEntry("Schattenpanzerhelm", "5g 32s 10c")
             print("|cff00ff00AHSalesLog:|r Testeintrag hinzugefügt.")
         end
 
