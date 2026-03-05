@@ -7,7 +7,7 @@
 -- ============================================================
 
 local ADDON_NAME = "AHSalesLog"
-local ADDON_VERSION = "1.8.1"
+local ADDON_VERSION = "1.9.1"
 local MAX_ENTRIES = 200
 local MAIL_DELAY = 3600  -- 1 Stunde bis Mail ankommt
 
@@ -31,6 +31,13 @@ local minimapBtn      = nil
 local activeTab       = "sold"   -- "sold" oder "listed"
 local tabBtnSold      = nil
 local tabBtnListed    = nil
+local optionsFrame    = nil
+local optionsBtn      = nil
+
+local lastAuctionatorPostTime = 0
+local auctionatorRegistered = false
+local pendingSyncGraceSeconds = 15
+local pendingSyncRequested = false
 
 -- Rate-Limiter für Chat-Filter (verhindert Doppeleinträge bei mehreren Chatframes)
 local lastFilterMsg  = nil
@@ -47,6 +54,14 @@ local function InitDB()
     if not AHSalesLogDB.minimapAngle     then AHSalesLogDB.minimapAngle     = 225 end
     if not AHSalesLogDB.seenMailKeys     then AHSalesLogDB.seenMailKeys     = {} end
     if not AHSalesLogDB.pendingAuctions  then AHSalesLogDB.pendingAuctions  = {} end
+    if not AHSalesLogDB.activeMailSales  then AHSalesLogDB.activeMailSales  = {} end
+    if not AHSalesLogDB.settings         then AHSalesLogDB.settings         = {} end
+    if AHSalesLogDB.settings.autoRemoveOnMail == nil then
+        AHSalesLogDB.settings.autoRemoveOnMail = false
+    end
+    if AHSalesLogDB.settings.allowManualDelete == nil then
+        AHSalesLogDB.settings.allowManualDelete = false
+    end
 
     -- Alte pending-Einträge entfernen (älter als 48h)
     local now = time()
@@ -154,10 +169,13 @@ local function AddEntry(item, price, buyoutCopper, itemCount)
 end
 
 -- Sucht den neuesten Eintrag ohne Preis für das gegebene Item und setzt den Preis.
-local function EnrichEntryPrice(item, priceStr)
+local function EnrichEntryPrice(item, priceStr, copper)
     for _, entry in ipairs(AHSalesLogDB.entries) do
         if entry.price == "" and entry.item == item then
             entry.price = priceStr
+            if copper and copper > 0 then
+                entry.buyout = copper
+            end
             return true
         end
     end
@@ -185,6 +203,144 @@ local function FindPendingPrice(itemName)
         end
     end
     return nil, 0
+end
+
+local function RemoveOnePendingAuction(itemName, itemCount, buyoutPrice)
+    if not itemName or itemName == "" then return false end
+    local pending = AHSalesLogDB.pendingAuctions
+    local targetCount = itemCount or 1
+    local targetBuyout = buyoutPrice or 0
+
+    local function RemoveByMatch(matchFn)
+        for i, entry in ipairs(pending) do
+            if matchFn(entry) then
+                table.remove(pending, i)
+                if AHSalesLogFrame and AHSalesLogFrame:IsShown() and activeTab == "listed" then
+                    AHSalesLog_RefreshList()
+                end
+                return true
+            end
+        end
+        return false
+    end
+
+    if RemoveByMatch(function(entry)
+        return entry.item == itemName and (entry.count or 1) == targetCount and (entry.buyout or 0) == targetBuyout
+    end) then
+        return true
+    end
+
+    if RemoveByMatch(function(entry)
+        return entry.item == itemName and (entry.count or 1) == targetCount
+    end) then
+        return true
+    end
+
+    return RemoveByMatch(function(entry)
+        return entry.item == itemName
+    end)
+end
+
+local function RemoveOneSoldEntry(itemName, money)
+    local entries = AHSalesLogDB.entries
+    local targetMoney = money or 0
+    -- 1. Exakt: Item + Preis nach AH-Cut (5%) matchen
+    if targetMoney > 0 then
+        for i, entry in ipairs(entries) do
+            local entryMoney = entry.buyout or 0
+            local itemMatch = (not itemName or itemName == "" or entry.item == itemName)
+            if itemMatch and entryMoney > 0 and
+               (entryMoney == targetMoney or math.floor(entryMoney * 0.95) == targetMoney) then
+                table.remove(entries, i)
+                return true
+            end
+        end
+    end
+    -- 2. Fallback: nur nach Item-Name
+    if itemName and itemName ~= "" then
+        for i, entry in ipairs(entries) do
+            if entry.item == itemName then
+                table.remove(entries, i)
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function ReconcilePendingWithOwnedAuctions()
+    if not GetNumAuctionItems or not GetAuctionItemInfo then return end
+
+    local owned = {}
+    for i = 1, GetNumAuctionItems("owner") do
+        local name, _, count, _, _, _, _, _, _, buyoutPrice = GetAuctionItemInfo("owner", i)
+        if name then
+            table.insert(owned, {
+                item = name,
+                count = count or 1,
+                buyout = buyoutPrice or 0,
+            })
+        end
+    end
+
+    local function ConsumeOwnedMatch(entry)
+        local entryCount = entry.count or 1
+        local entryBuyout = entry.buyout or 0
+
+        for idx, ownedEntry in ipairs(owned) do
+            if ownedEntry.item == entry.item and ownedEntry.count == entryCount and ownedEntry.buyout == entryBuyout then
+                table.remove(owned, idx)
+                return true
+            end
+        end
+        for idx, ownedEntry in ipairs(owned) do
+            if ownedEntry.item == entry.item and ownedEntry.count == entryCount then
+                table.remove(owned, idx)
+                return true
+            end
+        end
+        for idx, ownedEntry in ipairs(owned) do
+            if ownedEntry.item == entry.item then
+                table.remove(owned, idx)
+                return true
+            end
+        end
+        return false
+    end
+
+    local pending = AHSalesLogDB.pendingAuctions
+    local now = time()
+    local changed = false
+    for i = #pending, 1, -1 do
+        local entry = pending[i]
+        if not ConsumeOwnedMatch(entry) then
+            local age = now - (entry.posted or now)
+            if age > pendingSyncGraceSeconds then
+                table.remove(pending, i)
+                changed = true
+            end
+        end
+    end
+
+    if changed and AHSalesLogFrame and AHSalesLogFrame:IsShown() and activeTab == "listed" then
+        AHSalesLog_RefreshList()
+    end
+end
+
+local function RequestOwnedAuctionsUpdate()
+    if GetOwnerAuctionItems then
+        pcall(GetOwnerAuctionItems, 0)
+    end
+end
+
+local cancelAuctionHooked = false
+local function HookCancelAuction()
+    if cancelAuctionHooked or not CancelAuction then return end
+    hooksecurefunc("CancelAuction", function()
+        pendingSyncRequested = true
+        RequestOwnedAuctionsUpdate()
+    end)
+    cancelAuctionHooked = true
 end
 
 -- Slot-Monitor: Erfasst Item-Info und Buyout-Preis wenn eine Auktion erstellt wird.
@@ -262,9 +418,10 @@ end)
 -- Auctionator-Kompatibilität
 -- ============================================================
 
-local lastAuctionatorPostTime = 0
-
 local function TryRegisterAuctionator()
+    if auctionatorRegistered then
+        return true
+    end
     if not Auctionator or not Auctionator.EventBus or not Auctionator.Selling or not Auctionator.Selling.Events then
         return false
     end
@@ -286,10 +443,25 @@ local function TryRegisterAuctionator()
             end
 
             lastAuctionatorPostTime = GetTime()
+        elseif Auctionator.Cancelling and Auctionator.Cancelling.Events and eventName == Auctionator.Cancelling.Events.CancelConfirmed then
+            local itemLink = details and details.itemLink or nil
+            local itemName = itemLink and StripLinks(itemLink) or nil
+            local stackSize = details and details.stackSize or 1
+            local stackPrice = details and details.stackPrice or 0
+            if itemName and itemName ~= "" then
+                RemoveOnePendingAuction(itemName, stackSize, stackPrice)
+            end
+            pendingSyncRequested = true
+            RequestOwnedAuctionsUpdate()
         end
     end
 
-    Auctionator.EventBus:Register(listener, { Auctionator.Selling.Events.PostSuccessful })
+    local events = { Auctionator.Selling.Events.PostSuccessful }
+    if Auctionator.Cancelling and Auctionator.Cancelling.Events and Auctionator.Cancelling.Events.CancelConfirmed then
+        table.insert(events, Auctionator.Cancelling.Events.CancelConfirmed)
+    end
+    Auctionator.EventBus:Register(listener, events)
+    auctionatorRegistered = true
     return true
 end
 
@@ -331,30 +503,32 @@ end
 
 local function ScanMailbox()
     local numItems = GetInboxNumItems()
-    if numItems == 0 then return end
 
     local seenKeys  = AHSalesLogDB.seenMailKeys
+    local previousActive = AHSalesLogDB.activeMailSales or {}
+    local currentActive = {}
     local refreshUI = false
 
     for i = 1, numItems do
         local _, _, sender, subject, money, _, daysLeft = GetInboxHeaderInfo(i)
 
         if IsAHSender(sender) and money and money > 0 then
+            local item = nil
+            if subject then
+                item = subject:match("%[(.-)%]") or StripLinks(subject)
+            end
+
             local dayKey = math.floor((daysLeft or 0) * 100)
             local key = (subject or "") .. "|" .. tostring(money) .. "|" .. tostring(dayKey)
+            currentActive[key] = { item = item, money = money }
 
             if not seenKeys[key] then
                 seenKeys[key] = true
 
-                local item = nil
-                if subject then
-                    item = subject:match("%[(.-)%]") or StripLinks(subject)
-                end
-
                 local priceStr = FormatMoney(money)
 
                 if item and item ~= "" then
-                    if EnrichEntryPrice(item, priceStr) then
+                    if EnrichEntryPrice(item, priceStr, money) then
                         refreshUI = true
                     end
                 end
@@ -362,18 +536,24 @@ local function ScanMailbox()
         end
     end
 
+    if AHSalesLogDB.settings.autoRemoveOnMail then
+        for key, info in pairs(previousActive) do
+            if not currentActive[key] then
+                if RemoveOneSoldEntry(info.item, info.money) then
+                    refreshUI = true
+                end
+            end
+        end
+    end
+    AHSalesLogDB.activeMailSales = currentActive
+
     -- seenMailKeys auf max. 500 Einträge begrenzen
     local count = 0
     for _ in pairs(seenKeys) do count = count + 1 end
     if count > 500 then
         AHSalesLogDB.seenMailKeys = {}
-        for i = 1, numItems do
-            local _, _, sender, subject, money, _, daysLeft = GetInboxHeaderInfo(i)
-            if IsAHSender(sender) and money and money > 0 then
-                local dayKey = math.floor((daysLeft or 0) * 100)
-                local key = (subject or "") .. "|" .. tostring(money) .. "|" .. tostring(dayKey)
-                AHSalesLogDB.seenMailKeys[key] = true
-            end
+        for key in pairs(currentActive) do
+            AHSalesLogDB.seenMailKeys[key] = true
         end
     end
 
@@ -385,6 +565,60 @@ end
 -- ============================================================
 -- UI: Hauptfenster
 -- ============================================================
+
+local function CreateLabeledCheckbox(parent, text, x, y, onClick)
+    local cb = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
+    cb:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
+    cb:SetScript("OnClick", onClick)
+
+    local label = parent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    label:SetPoint("LEFT", cb, "RIGHT", 4, 1)
+    label:SetText(text)
+    cb.label = label
+    return cb
+end
+
+local function CreateOptionsFrame()
+    local f = CreateFrame("Frame", "AHSalesLogOptionsFrame", AHSalesLogFrame, "BasicFrameTemplateWithInset")
+    f:SetSize(380, 170)
+    f:SetPoint("TOPLEFT", AHSalesLogFrame, "TOPRIGHT", 8, 0)
+    f:SetFrameStrata("DIALOG")
+    f:Hide()
+
+    f.TitleText:SetText("AH Sales Log Optionen")
+
+    local autoMail = CreateLabeledCheckbox(f, "Verkäufe nach Mail-Abholung automatisch entfernen", 14, -36, function(self)
+        AHSalesLogDB.settings.autoRemoveOnMail = self:GetChecked() and true or false
+    end)
+    f.autoMail = autoMail
+
+    local manualDelete = CreateLabeledCheckbox(f, "Einzelne Einträge per Rechtsklick löschen", 14, -68, function(self)
+        AHSalesLogDB.settings.allowManualDelete = self:GetChecked() and true or false
+    end)
+    f.manualDelete = manualDelete
+
+    local help = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    help:SetPoint("TOPLEFT", f, "TOPLEFT", 18, -102)
+    help:SetJustifyH("LEFT")
+    help:SetTextColor(0.8, 0.8, 0.8)
+    help:SetText("Hinweis:\nAutomatisch entfernt nur Verkäufe, deren AH-Mail aus dem Postfach verschwunden ist.")
+
+    f:SetScript("OnShow", function(self)
+        self.autoMail:SetChecked(AHSalesLogDB.settings.autoRemoveOnMail)
+        self.manualDelete:SetChecked(AHSalesLogDB.settings.allowManualDelete)
+    end)
+
+    optionsFrame = f
+end
+
+local function ToggleOptionsFrame()
+    if not optionsFrame then return end
+    if optionsFrame:IsShown() then
+        optionsFrame:Hide()
+    else
+        optionsFrame:Show()
+    end
+end
 
 local function CreateMainFrame()
     local f = CreateFrame("Frame", "AHSalesLogFrame", UIParent, "BasicFrameTemplateWithInset")
@@ -404,6 +638,12 @@ local function CreateMainFrame()
         local point, _, _, x, y = self:GetPoint()
         AHSalesLogDB.framePos = { point = point, x = x, y = y }
     end)
+
+    optionsBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    optionsBtn:SetSize(70, 20)
+    optionsBtn:SetPoint("RIGHT", f.CloseButton, "LEFT", -2, 0)
+    optionsBtn:SetText("Optionen")
+    optionsBtn:SetScript("OnClick", ToggleOptionsFrame)
 
     -- Tab-Buttons
     local tabTop = -28
@@ -469,13 +709,23 @@ local function CreateMainFrame()
     clearBtn:SetSize(80, 22)
     clearBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", PAD, 6)
     clearBtn:SetText("Leeren")
+    StaticPopupDialogs["AHSALESLOG_CLEAR_CONFIRM"] = {
+        text = "Alle Eintr\195\164ge im aktuellen Tab l\195\182schen?",
+        button1 = "Ja",
+        button2 = "Nein",
+        OnAccept = function()
+            if activeTab == "sold" then
+                AHSalesLogDB.entries = {}
+            else
+                AHSalesLogDB.pendingAuctions = {}
+            end
+            AHSalesLog_RefreshList()
+        end,
+        timeout = 0,
+        whileDead = true,
+    }
     clearBtn:SetScript("OnClick", function()
-        if activeTab == "sold" then
-            AHSalesLogDB.entries = {}
-        else
-            AHSalesLogDB.pendingAuctions = {}
-        end
-        AHSalesLog_RefreshList()
+        StaticPopup_Show("AHSALESLOG_CLEAR_CONFIRM")
     end)
 
     -- Summe-Label (links neben Count)
@@ -561,10 +811,22 @@ function AHSalesLog_RefreshList()
                         GameTooltip:AddLine("Preis: " .. self.fullPrice, 0.4, 1, 0.4)
                     end
                     GameTooltip:AddLine(self.fullTime, 0.6, 0.6, 0.6)
+                    if AHSalesLogDB.settings.allowManualDelete then
+                        GameTooltip:AddLine("Rechtsklick: Eintrag löschen", 1, 0.8, 0.3)
+                    end
                     GameTooltip:Show()
                 end
             end)
             row:SetScript("OnLeave", function() GameTooltip:Hide() end)
+            row:SetScript("OnMouseUp", function(self, button)
+                if button ~= "RightButton" then return end
+                if not AHSalesLogDB.settings.allowManualDelete then return end
+                local list = (activeTab == "sold") and AHSalesLogDB.entries or AHSalesLogDB.pendingAuctions
+                if self.entryIndex and list[self.entryIndex] then
+                    table.remove(list, self.entryIndex)
+                    AHSalesLog_RefreshList()
+                end
+            end)
 
             rowFrames[i] = row
         end
@@ -590,6 +852,7 @@ function AHSalesLog_RefreshList()
         row.fullItem  = displayItem
         row.fullPrice = displayPrice
         row.fullTime  = displayTime
+        row.entryIndex = i
 
         row.ts:SetText(displayTime)
         row.ts:SetTextColor(0.6, 0.6, 0.6)
@@ -792,6 +1055,7 @@ eventFrame:RegisterEvent("MAIL_INBOX_UPDATE")
 eventFrame:RegisterEvent("AUCTION_HOUSE_SHOW")
 eventFrame:RegisterEvent("AUCTION_HOUSE_CLOSED")
 eventFrame:RegisterEvent("NEW_AUCTION_UPDATE")
+eventFrame:RegisterEvent("AUCTION_OWNED_LIST_UPDATE")
 
 eventFrame:SetScript("OnEvent", function(self, event, ...)
     if event == "ADDON_LOADED" then
@@ -799,7 +1063,9 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         if name ~= ADDON_NAME then return end
 
         InitDB()
+        HookCancelAuction()
         CreateMainFrame()
+        CreateOptionsFrame()
         CreateMinimapButton()
 
         local pos = AHSalesLogDB.framePos
@@ -874,8 +1140,11 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
     elseif event == "AUCTION_HOUSE_SHOW" then
         ahIsOpen = true
         pollFrame:Show()
+        HookCancelAuction()
+        pendingSyncRequested = true
+        RequestOwnedAuctionsUpdate()
         -- Zweiter Versuch: Auctionator könnte nach uns geladen worden sein
-        if lastAuctionatorPostTime == 0 then
+        if not auctionatorRegistered then
             TryRegisterAuctionator()
         end
         pendingSellName  = nil
@@ -891,6 +1160,12 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
 
     elseif event == "NEW_AUCTION_UPDATE" then
         OnAuctionSlotChanged()
+
+    elseif event == "AUCTION_OWNED_LIST_UPDATE" then
+        if pendingSyncRequested then
+            pendingSyncRequested = false
+            ReconcilePendingWithOwnedAuctions()
+        end
 
     elseif event == "MAIL_INBOX_UPDATE" then
         ScanMailbox()
