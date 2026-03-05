@@ -7,7 +7,7 @@
 -- ============================================================
 
 local ADDON_NAME = "AHSalesLog"
-local ADDON_VERSION = "1.2.1"
+local ADDON_VERSION = "1.3.0"
 local MAX_ENTRIES = 200
 
 local COL_TS    = 80
@@ -169,28 +169,66 @@ local function FindPendingPrice(itemName)
     return nil
 end
 
-local function HookStartAuction()
-    hooksecurefunc("StartAuction", function(startPrice, buyoutPrice, duration)
-        local name, _, count = GetAuctionSellItemInfo()
-        if name then
-            local price = buyoutPrice and buyoutPrice > 0 and buyoutPrice or startPrice
-            table.insert(AHSalesLogDB.pendingAuctions, {
-                item     = name,
-                buyout   = price,
-                priceStr = FormatMoney(price),
-                count    = count or 1,
-                posted   = time(),
-                time     = GetTimestamp(),
-            })
-            -- Limit auf 200
-            while #AHSalesLogDB.pendingAuctions > 200 do
-                table.remove(AHSalesLogDB.pendingAuctions, 1)
+-- Speichert Item-Info, bevor StartAuction aufgerufen wird
+-- (nach StartAuction kann GetAuctionSellItemInfo() nil sein)
+local pendingItemName  = nil
+local pendingItemCount = nil
+local auctionHooked    = false
+
+local function AddPendingAuction(itemName, itemCount, startPrice, buyoutPrice)
+    if not itemName then return end
+    local price = buyoutPrice and buyoutPrice > 0 and buyoutPrice or startPrice
+    table.insert(AHSalesLogDB.pendingAuctions, {
+        item     = itemName,
+        buyout   = price,
+        priceStr = FormatMoney(price),
+        count    = itemCount or 1,
+        posted   = time(),
+        time     = GetTimestamp(),
+    })
+    while #AHSalesLogDB.pendingAuctions > 200 do
+        table.remove(AHSalesLogDB.pendingAuctions, 1)
+    end
+    if AHSalesLogFrame and AHSalesLogFrame:IsShown() and activeTab == "listed" then
+        AHSalesLog_RefreshList()
+    end
+end
+
+local function HookAuctionHouse()
+    if auctionHooked then return end
+    auctionHooked = true
+
+    -- Methode 1: StartAuction hooken (funktioniert wenn die Funktion existiert)
+    if StartAuction then
+        hooksecurefunc("StartAuction", function(startPrice, buyoutPrice, duration)
+            -- Versuche Item-Info direkt zu lesen (manchmal noch verfügbar)
+            local name, _, count = GetAuctionSellItemInfo()
+            -- Fallback: vorher gespeicherte Info vom Button-Hook
+            name  = name  or pendingItemName
+            count = count or pendingItemCount
+            AddPendingAuction(name, count, startPrice, buyoutPrice)
+            pendingItemName  = nil
+            pendingItemCount = nil
+        end)
+    end
+
+    -- Methode 2: Create-Auction-Button hooken (Fallback + Item-Info vorher erfassen)
+    if AuctionsCreateAuctionButton then
+        AuctionsCreateAuctionButton:HookScript("OnClick", function()
+            -- Item-Info erfassen bevor StartAuction das Item verbraucht
+            local name, _, count = GetAuctionSellItemInfo()
+            if name then
+                pendingItemName  = name
+                pendingItemCount = count
+                -- Falls StartAuction nicht existiert, direkt speichern
+                if not StartAuction then
+                    local startPrice  = MoneyInputFrame_GetCopper(StartPrice) or 0
+                    local buyoutPrice = MoneyInputFrame_GetCopper(BuyoutPrice) or 0
+                    AddPendingAuction(name, count, startPrice, buyoutPrice)
+                end
             end
-            if AHSalesLogFrame and AHSalesLogFrame:IsShown() and activeTab == "listed" then
-                AHSalesLog_RefreshList()
-            end
-        end
-    end)
+        end)
+    end
 end
 
 -- ============================================================
@@ -595,6 +633,7 @@ end
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("ADDON_LOADED")
 eventFrame:RegisterEvent("MAIL_INBOX_UPDATE")
+eventFrame:RegisterEvent("AUCTION_HOUSE_SHOW")
 
 eventFrame:SetScript("OnEvent", function(self, event, ...)
     if event == "ADDON_LOADED" then
@@ -610,8 +649,6 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         AHSalesLogFrame:SetPoint(pos.point, UIParent, pos.point, pos.x, pos.y)
 
         ChatFrame_AddMessageEventFilter("CHAT_MSG_SYSTEM", AHSalesLog_ChatFilter)
-
-        HookStartAuction()
 
         SLASH_AHSALESLOG1 = "/ahlog"
         SLASH_AHSALESLOG2 = "/ahsaleslog"
@@ -650,6 +687,9 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         end
 
         print("|cff00ff00AHSalesLog|r geladen.  /ahlog  /ahlogtest  /ahlogtest2")
+
+    elseif event == "AUCTION_HOUSE_SHOW" then
+        HookAuctionHouse()
 
     elseif event == "MAIL_INBOX_UPDATE" then
         ScanMailbox()
