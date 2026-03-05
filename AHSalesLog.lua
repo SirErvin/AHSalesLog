@@ -7,7 +7,7 @@
 -- ============================================================
 
 local ADDON_NAME = "AHSalesLog"
-local ADDON_VERSION = "1.2.0"
+local ADDON_VERSION = "1.2.1"
 local MAX_ENTRIES = 200
 
 local COL_TS    = 80
@@ -169,8 +169,8 @@ local function FindPendingPrice(itemName)
     return nil
 end
 
-local function HookPostAuction()
-    hooksecurefunc("PostAuction", function(startPrice, buyoutPrice, duration)
+local function HookStartAuction()
+    hooksecurefunc("StartAuction", function(startPrice, buyoutPrice, duration)
         local name, _, count = GetAuctionSellItemInfo()
         if name then
             local price = buyoutPrice and buyoutPrice > 0 and buyoutPrice or startPrice
@@ -611,7 +611,7 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
 
         ChatFrame_AddMessageEventFilter("CHAT_MSG_SYSTEM", AHSalesLog_ChatFilter)
 
-        HookPostAuction()
+        HookStartAuction()
 
         SLASH_AHSALESLOG1 = "/ahlog"
         SLASH_AHSALESLOG2 = "/ahsaleslog"
