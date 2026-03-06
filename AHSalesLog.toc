@@ -2,7 +2,7 @@
 ## Title: AH Sales Log
 ## Notes: Protokolliert Auktionshaus-Verkäufe mit Zeitstempel und Preis
 ## Author: Niklas Hiller
-## Version: 1.0
+## Version: 1.25.11
 ## SavedVariables: AHSalesLogDB
 
 AHSalesLog.lua
